@@ -41,7 +41,12 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
         result {
             let timeout = defaultArg timeoutMs 2000
             do! transport.Write(packet)
-            let! response = transport.Read(64, timeout)
+            let! response =
+                transport.Read(64, timeout)
+                |> Result.mapError (fun e ->
+                    match e with
+                    | UsbError (_, code) -> UsbError ($"Bulk transfer in timed out waiting for ACK 0x{expectedCommand:x2}", code)
+                    | other -> other)
             match response with
             | Protocol.AckResponse (cmd, _) when cmd = expectedCommand ->
                 return ()
@@ -58,7 +63,12 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
     member this.ReadCommandResponse(expectedCommand: byte, ?timeoutMs: int) : Result<byte[], DriverError> =
         result {
             let timeout = defaultArg timeoutMs 3000
-            let! response = transport.Read(1024, timeout)
+            let! response =
+                transport.Read(1024, timeout)
+                |> Result.mapError (fun e ->
+                    match e with
+                    | UsbError (_, code) -> UsbError ($"Bulk transfer in timed out waiting for response 0x{expectedCommand:x2}", code)
+                    | other -> other)
             match response with
             | Protocol.CommandResponse (cmd, payload) when cmd = expectedCommand ->
                 return payload
@@ -74,7 +84,12 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
         result {
             let timeout = defaultArg timeoutMs 3000
             do! transport.Write(packet)
-            let! firstResponse = transport.Read(1024, timeout)
+            let! firstResponse =
+                transport.Read(1024, timeout)
+                |> Result.mapError (fun e ->
+                    match e with
+                    | UsbError (_, code) -> UsbError ($"Bulk transfer in timed out waiting for response 0x{expectedCommand:x2}", code)
+                    | other -> other)
             match firstResponse with
             | Protocol.CommandResponse (cmd, payload) when cmd = expectedCommand ->
                 return payload
@@ -286,8 +301,11 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
     // ------------------------------------------------------------------------
 
     member this.ActivateSession() : Task<Result<SensorOtp, DriverError>> = taskResult {
-        // 1. Send NOP wakeup
+        // 1. Send NOP wakeup & query firmware version to verify MCU is awake and ready in APP mode
         do! this.SendNopWakeup()
+        let! fw = this.ReadFirmwareVersion()
+        if not (fw.StartsWith("GF5298_GM168SEC_APP")) then
+            do! Error (FirmwareMismatch ("GF5298_GM168SEC_APP_13016", fw))
 
         // 2. Enable chip before reset
         do! this.SendAndExpectAck(Protocol.packEnableChip true, Protocol.CommandEnableChip)
