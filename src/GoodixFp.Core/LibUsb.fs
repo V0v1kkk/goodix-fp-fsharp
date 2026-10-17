@@ -56,15 +56,12 @@ module private NativeLibUsb =
     )
 
     [<DllImport(LibUsbName, CallingConvention = CallingConvention.Cdecl)>]
+    extern int libusb_clear_halt(nativeint dev_handle, byte endpoint)
+
+    [<DllImport(LibUsbName, CallingConvention = CallingConvention.Cdecl)>]
     extern nativeint libusb_strerror(int errcode)
 
-// ============================================================================
-// LibUsb Implementation for Goodix 53xd Devices
-// ============================================================================
-
-type LibUsbTransport private (ctx: nativeint, handle: nativeint, interfaceNumber: int) =
-    let mutable isDisposed = false
-
+module private LibUsbConstants =
     [<Literal>]
     let EndpointOut = 0x01uy
 
@@ -73,6 +70,15 @@ type LibUsbTransport private (ctx: nativeint, handle: nativeint, interfaceNumber
 
     [<Literal>]
     let ChunkSize = 64 // 0x40 bytes chunking
+
+open LibUsbConstants
+
+// ============================================================================
+// LibUsb Implementation for Goodix 53xd Devices
+// ============================================================================
+
+type LibUsbTransport private (ctx: nativeint, handle: nativeint, interfaceNumber: int) =
+    let mutable isDisposed = false
 
     static member Open(vid: UsbVid, pid: UsbPid, ?interfaceNumber: int) : Result<LibUsbTransport, DriverError> =
         let iface = defaultArg interfaceNumber 0
@@ -100,6 +106,8 @@ type LibUsbTransport private (ctx: nativeint, handle: nativeint, interfaceNumber
                             NativeLibUsb.libusb_exit(ctx)
                             Error (UsbError ("Failed to claim interface", claimRes))
                         else
+                            NativeLibUsb.libusb_clear_halt(devHandle, EndpointOut) |> ignore
+                            NativeLibUsb.libusb_clear_halt(devHandle, EndpointIn) |> ignore
                             Ok (new LibUsbTransport(ctx, devHandle, iface))
                 else
                     let claimRes = NativeLibUsb.libusb_claim_interface(devHandle, iface)
@@ -108,6 +116,8 @@ type LibUsbTransport private (ctx: nativeint, handle: nativeint, interfaceNumber
                         NativeLibUsb.libusb_exit(ctx)
                         Error (UsbError ("Failed to claim interface", claimRes))
                     else
+                        NativeLibUsb.libusb_clear_halt(devHandle, EndpointOut) |> ignore
+                        NativeLibUsb.libusb_clear_halt(devHandle, EndpointIn) |> ignore
                         Ok (new LibUsbTransport(ctx, devHandle, iface))
 
     interface IUsbTransport with

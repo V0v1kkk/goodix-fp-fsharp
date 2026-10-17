@@ -66,13 +66,24 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
                 return! Error (InvalidPacket reason)
         }
 
+    member private this.SendNopWakeup() : Result<unit, DriverError> =
+        result {
+            do! transport.Write(Protocol.packNop())
+            // Best effort: read response if device sends ACK, but ignore timeout if waking up
+            match transport.Read(64, 150) with
+            | Ok _ -> ()
+            | Error (Timeout _) | Error (UsbError (_, -7)) -> ()
+            | Error err -> return! Error err
+            System.Threading.Thread.Sleep(50)
+        }
+
     // ------------------------------------------------------------------------
     // Workflow 1: Probe Device Information
     // ------------------------------------------------------------------------
 
     member this.ProbeInfo() : Task<Result<DeviceInfo, DriverError>> = taskResult {
-        // 1. Send NOP
-        do! this.SendAndExpectAck(Protocol.packNop(), Protocol.CommandNop)
+        // 1. Send NOP wakeup
+        do! this.SendNopWakeup()
 
         // 2. Query Firmware Version
         let! fwPayload = this.SendAndReceive(Protocol.packFirmwareVersion(), Protocol.CommandFirmwareVersion)
