@@ -4,6 +4,8 @@
   </Folder>
   <Folder Name="/src/">
     <Project Path="src/GoodixFp.Core/GoodixFp.Core.fsproj" />
+    <Project Path="src/GoodixFp.NativeMatcher/GoodixFp.NativeMatcher.fsproj" />
+    <Project Path="src/GoodixFp.Cli/GoodixFp.Cli.fsproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/GoodixFp.Tests/GoodixFp.Tests.fsproj" />

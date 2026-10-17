@@ -1,8 +1,9 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
     <IsPackable>false</IsPackable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
   </PropertyGroup>
 
   <ItemGroup>
@@ -20,6 +21,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\GoodixFp.Core\GoodixFp.Core.fsproj" />
+    <ProjectReference Include="..\..\src\GoodixFp.NativeMatcher\GoodixFp.NativeMatcher.fsproj" />
   </ItemGroup>
 
 </Project>

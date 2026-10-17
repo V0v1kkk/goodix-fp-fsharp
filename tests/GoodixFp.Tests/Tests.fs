@@ -6,6 +6,7 @@ open System.Threading.Tasks
 open Xunit
 open Org.BouncyCastle.Tls
 open GoodixFp.Core
+open GoodixFp.NativeMatcher
 
 // ============================================================================
 // Types & Domain DU Discipline Tests
@@ -459,3 +460,139 @@ let ``Goodix53xdDevice Sleep sends sleep command and receives ACK`` () =
             Assert.True(mockTransport.WrittenPackets.Length > 0)
         | Error err -> Assert.Fail($"Sleep failed: {err}")
     }
+
+// ============================================================================
+// NativeMatcher Types & Domain Discipline Tests
+// ============================================================================
+
+[<Fact>]
+let ``LibraryPath rejects whitespace and empty strings`` () =
+    Assert.True(LibraryPath.create "" |> Result.isError)
+    Assert.True(LibraryPath.create "   " |> Result.isError)
+    let tempFile = Path.GetTempFileName()
+    try
+        match LibraryPath.create tempFile with
+        | Ok p -> Assert.Equal(tempFile, p.Value)
+        | Error err -> Assert.Fail(string err)
+    finally
+        if File.Exists tempFile then File.Delete tempFile
+
+[<Fact>]
+let ``FingerId rejects whitespace and empty strings`` () =
+    Assert.True(FingerId.create "" |> Result.isError)
+    Assert.True(FingerId.create "   " |> Result.isError)
+    match FingerId.create "finger1" with
+    | Ok fid -> Assert.Equal("finger1", fid.Value)
+    | Error err -> Assert.Fail(string err)
+
+[<Fact>]
+let ``TemplateBlob validates non-empty and minimum header length`` () =
+    Assert.True(TemplateBlob.create [||] |> Result.isError)
+    Assert.True(TemplateBlob.create [| 0x54uy; 0x47uy |] |> Result.isError)
+    let validBlob = Array.create 65649 0uy
+    validBlob.[0] <- 0x54uy // 'T'
+    validBlob.[1] <- 0x47uy // 'G'
+    validBlob.[2] <- 0x4cuy // 'L'
+    validBlob.[3] <- 0x41uy // 'A'
+    match TemplateBlob.create validBlob with
+    | Ok tb ->
+        Assert.Equal(65649, tb.Length)
+        Assert.Equal<byte seq>(validBlob, tb.Value)
+    | Error err -> Assert.Fail(string err)
+
+// ============================================================================
+// NativeMatcher E2E Matching & Preprocessing Tests
+// ============================================================================
+
+let private generateSyntheticRidgeFrame (shiftX: float) (shiftY: float) (noise: float) =
+    let width = 80
+    let height = 64
+    let cx = 40.0 + shiftX
+    let cy = 32.0 + shiftY
+    let pixels = Array.zeroCreate<uint16> (width * height)
+    for y in 0 .. height - 1 do
+        for x in 0 .. width - 1 do
+            let dx = float x - cx
+            let dy = float y - cy
+            let r = Math.Sqrt(dx * dx + dy * dy)
+            let theta = Math.Atan2(dy, dx)
+            let ridge = Math.Sin(r * 0.8 - theta * 3.0)
+            let rawVal = 2048.0 + 800.0 * ridge + noise * (float ((x * 17 + y * 31) % 50) - 25.0)
+            let clamped = Math.Clamp(rawVal, 0.0, 4095.0)
+            pixels.[y * width + x] <- uint16 clamped
+    pixels
+
+[<Fact>]
+let ``GoodixTodMatcher E2E enrolls 12 samples, exports 65KB TGLA template, matches genuine and rejects impostor`` () =
+    let home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)
+    let candidatePaths = [
+        Path.Combine(home, ".local/share/goodix-fp/libgoodix_tod_53xc.so")
+        "/tmp/libgoodix_standalone.so"
+    ]
+    let libPathOpt = candidatePaths |> List.tryFind File.Exists
+    match libPathOpt with
+    | None ->
+        // In environments without native lib, skip gracefully
+        ()
+    | Some pathStr ->
+        let libPath = LibraryPath.create pathStr |> Result.defaultWith (fun e -> failwith (string e))
+        use matcher = GoodixTodMatcher.create libPath |> Result.defaultWith (fun e -> failwith $"Failed to create matcher: {e}")
+
+        // 1. Verify preprocessing
+        let testFrame = generateSyntheticRidgeFrame 0.0 0.0 0.0
+        match matcher.Preprocess(testFrame) with
+        | Error err -> Assert.Fail($"Preprocess failed: {err}")
+        | Ok prep ->
+            Assert.True(prep.Quality.Value > 0, "Quality score should be > 0")
+            Assert.True(prep.Coverage.Value > 0, "Coverage score should be > 0")
+            Assert.Equal(80 * 64, prep.NormalizedPixels.Length)
+
+        // 2. Start enrollment
+        match matcher.StartEnroll() with
+        | Error err -> Assert.Fail($"StartEnroll failed: {err}")
+        | Ok () -> ()
+
+        // 3. Merge 12 synthetic samples
+        for i in 0 .. 11 do
+            let sx = float (i % 3 - 1) * 1.5
+            let sy = float (i / 3 - 2) * 1.5
+            let sample = generateSyntheticRidgeFrame sx sy 1.0
+            match matcher.MergeSample(sample) with
+            | Error err -> Assert.Fail($"MergeSample {i + 1} failed: {err}")
+            | Ok progress ->
+                Assert.Equal(i + 1, progress)
+
+        // 4. Commit template
+        let fingerId = FingerId.create "finger1" |> Result.defaultWith (fun e -> failwith (string e))
+        let templateBlob =
+            match matcher.CommitTemplate(fingerId) with
+            | Error err -> failwith $"CommitTemplate failed: {err}"
+            | Ok blob ->
+                Assert.True(blob.Length > 50000, $"Expected template size > 50KB, got {blob.Length}")
+                // Verify "TGLA" magic header
+                Assert.Equal(0x54uy, blob.Value.[0]) // 'T'
+                Assert.Equal(0x47uy, blob.Value.[1]) // 'G'
+                Assert.Equal(0x4cuy, blob.Value.[2]) // 'L'
+                Assert.Equal(0x41uy, blob.Value.[3]) // 'A'
+                blob
+
+        let enrolledTemplates = [ (fingerId, templateBlob) ]
+
+        // 5. Genuine probe match
+        let genuineProbe = generateSyntheticRidgeFrame 0.5 0.5 1.0
+        match matcher.IdentifyProbe(genuineProbe, enrolledTemplates) with
+        | Error err -> Assert.Fail($"IdentifyProbe failed: {err}")
+        | Ok None -> Assert.Fail("Expected genuine probe to match template, but got None")
+        | Ok (Some matchedId) ->
+            Assert.Equal("finger1", matchedId.Value)
+
+        // 6. Impostor probe rejection
+        let impostorProbe = Array.init (80 * 64) (fun idx -> uint16 (1800 + (idx * 47) % 800))
+        match matcher.IdentifyProbe(impostorProbe, enrolledTemplates) with
+        | Error err -> Assert.Fail($"IdentifyProbe impostor failed: {err}")
+        | Ok (Some matchedId) ->
+            Assert.Fail($"Expected impostor probe to be rejected, but matched {matchedId.Value}")
+        | Ok None ->
+            // Impostor successfully rejected
+            ()
+

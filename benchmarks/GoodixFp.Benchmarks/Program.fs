@@ -5,6 +5,8 @@ open BenchmarkDotNet.Attributes
 open BenchmarkDotNet.Running
 open Org.BouncyCastle.Tls
 open GoodixFp.Core
+open GoodixFp.NativeMatcher
+open System.IO
 
 // ============================================================================
 // 1. TLS 1.2 PSK Handshake Benchmark: Pure F# vs BouncyCastle
@@ -203,6 +205,75 @@ type PacketFramingBenchmark() =
         Crc32.compute (ReadOnlySpan rawConfig)
 
 // ============================================================================
+// 5. Goodix TOD Native Matcher Benchmark: Preprocess & Identify Probe
+// ============================================================================
+
+[<MemoryDiagnoser>]
+type GoodixTodMatcherBenchmark() =
+    let mutable matcher: GoodixTodMatcher = Unchecked.defaultof<_>
+    let mutable testFrame: uint16[] = [||]
+    let mutable enrolledTemplates: (FingerId * TemplateBlob) list = []
+
+    static member GenerateSyntheticRidgeFrame(shiftX: float, shiftY: float, noise: float) : uint16[] =
+        let width = 80
+        let height = 64
+        let cx = 40.0 + shiftX
+        let cy = 32.0 + shiftY
+        let pixels = Array.zeroCreate<uint16> (width * height)
+        for y in 0 .. height - 1 do
+            for x in 0 .. width - 1 do
+                let dx = float x - cx
+                let dy = float y - cy
+                let r = Math.Sqrt(dx * dx + dy * dy)
+                let theta = Math.Atan2(dy, dx)
+                let ridge = Math.Sin(r * 0.8 - theta * 3.0)
+                let rawVal = 2048.0 + 800.0 * ridge + noise * (float ((x * 17 + y * 31) % 50) - 25.0)
+                let clamped = Math.Clamp(rawVal, 0.0, 4095.0)
+                pixels.[y * width + x] <- uint16 clamped
+        pixels
+
+    [<GlobalSetup>]
+    member this.Setup() =
+        let home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)
+        let candidatePaths = [
+            Path.Combine(home, ".local/share/goodix-fp/libgoodix_tod_53xc.so")
+            "/tmp/libgoodix_standalone.so"
+        ]
+        match candidatePaths |> List.tryFind File.Exists with
+        | None -> failwith "Goodix native library not found for benchmarks"
+        | Some pathStr ->
+            let libPath = LibraryPath.create pathStr |> Result.defaultWith (fun e -> failwith (string e))
+            matcher <- GoodixTodMatcher.Create(customPath = libPath.Value) |> Result.defaultWith (fun e -> failwith (string e))
+
+            testFrame <- GoodixTodMatcherBenchmark.GenerateSyntheticRidgeFrame(0.5, 0.5, 1.0)
+
+            matcher.StartEnroll() |> Result.defaultWith (fun e -> failwith (string e)) |> ignore
+            for i in 0 .. 11 do
+                let sx = float (i % 3 - 1) * 1.5
+                let sy = float (i / 3 - 2) * 1.5
+                let sample = GoodixTodMatcherBenchmark.GenerateSyntheticRidgeFrame(sx, sy, 1.0)
+                matcher.MergeSample(sample) |> Result.defaultWith (fun e -> failwith (string e)) |> ignore
+
+            let fid = FingerId.create "bench_finger" |> Result.defaultWith (fun e -> failwith (string e))
+            let blob = matcher.CommitTemplate(fid) |> Result.defaultWith (fun e -> failwith (string e))
+            enrolledTemplates <- [ (fid, blob) ]
+
+    [<Benchmark(Baseline = true)>]
+    member this.Preprocess_80x64Frame() : PreprocessedFrame =
+        matcher.Preprocess(testFrame) |> Result.defaultWith (fun e -> failwith (string e))
+
+    [<Benchmark>]
+    member this.Verify_ProbeAgainstTemplate() : bool =
+        match matcher.IdentifyProbe(testFrame, enrolledTemplates) with
+        | Ok (Some _) -> true
+        | _ -> false
+
+    [<GlobalCleanup>]
+    member this.Cleanup() =
+        if not (isNull (box matcher)) then
+            (matcher :> IDisposable).Dispose()
+
+// ============================================================================
 // Composition Root / Entry Point
 // ============================================================================
 
@@ -216,6 +287,7 @@ module Program =
             typeof<TlsDecryptionBenchmark>
             typeof<FrameDecoderBenchmark>
             typeof<PacketFramingBenchmark>
+            typeof<GoodixTodMatcherBenchmark>
         |]
 
         if args.Length = 0 then
@@ -223,20 +295,27 @@ module Program =
             let hs = TlsHandshakeBenchmark()
             let hsPure = hs.PureFSharp_Tls12PskHandshake()
             let hsBc = hs.BouncyCastle_Tls12PskHandshake()
-            printfn "  TLS Handshake Pure F#: %b | BouncyCastle: %b" hsPure hsBc
+            printfn $"  TLS Handshake Pure F#: {hsPure} | BouncyCastle: {hsBc}"
 
             let fd = FrameDecoderBenchmark()
             fd.Setup()
             let seqLen = fd.UnpackSequential_Array()
             let transLen = fd.UnpackAndTranspose_Array()
             let spanLen = fd.UnpackAndTranspose_Span()
-            printfn "  FrameDecoder Sequential: %d | Transpose Array: %d | Transpose Span: %d" seqLen transLen spanLen
+            printfn $"  FrameDecoder Sequential: {seqLen} | Transpose Array: {transLen} | Transpose Span: {spanLen}"
 
             let pf = PacketFramingBenchmark()
             pf.Setup()
             let cmd = pf.ActivePattern_ClassifyPacket()
             let crc = pf.Crc32_Compute7680Bytes()
-            printfn "  PacketFraming classified cmd: 0x%02x | CRC32: 0x%08x" cmd crc
+            printfn $"  PacketFraming classified cmd: 0x{cmd:X2} | CRC32: 0x{crc:X8}"
+
+            let m = GoodixTodMatcherBenchmark()
+            m.Setup()
+            let prep = m.Preprocess_80x64Frame()
+            let matchOk = m.Verify_ProbeAgainstTemplate()
+            m.Cleanup()
+            printfn $"  GoodixTodMatcher Preprocess Quality: {prep.Quality.Value} | Verify Matched: {matchOk}"
 
             printfn "Pass '--filter *' to run full BenchmarkDotNet sweeps."
             0

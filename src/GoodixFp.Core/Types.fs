@@ -122,6 +122,23 @@ type DriverError =
     | Timeout of operation: string
     | ValidationError of field: string * reason: string
     | InternalError of exn: exn
+with
+    member this.Message =
+        match this with
+        | UsbError (msg, code) -> $"USB error (code {code}): {msg}"
+        | ProtocolError msg -> $"Protocol error: {msg}"
+        | ChecksumMismatch (expected, actual) -> $"Checksum mismatch: expected 0x{expected:X8}, actual 0x{actual:X8}"
+        | InvalidPacket reason -> $"Invalid packet: {reason}"
+        | TlsHandshakeFailed reason -> $"TLS handshake failed: {reason}"
+        | TlsDecryptionFailed reason -> $"TLS decryption failed: {reason}"
+        | DeviceNotReady reason -> $"Device not ready: {reason}"
+        | FirmwareMismatch (expected, actual) -> $"Firmware mismatch: expected '{expected}', actual '{actual}'"
+        | ResetFailed reason -> $"Reset failed: {reason}"
+        | Timeout op -> $"Operation timed out: {op}"
+        | ValidationError (field, reason) -> $"Validation error on {field}: {reason}"
+        | InternalError ex -> $"Internal error: {ex.Message}"
+
+    override this.ToString() = this.Message
 
 // ============================================================================
 // Sensor OTP (One-Time Programmable) Parameters
