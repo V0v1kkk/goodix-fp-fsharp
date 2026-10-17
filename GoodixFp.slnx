@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/benchmarks/">
+    <Project Path="benchmarks/GoodixFp.Benchmarks/GoodixFp.Benchmarks.fsproj" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/GoodixFp.Core/GoodixFp.Core.fsproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/GoodixFp.Tests/GoodixFp.Tests.fsproj" />
+  </Folder>
+</Solution>

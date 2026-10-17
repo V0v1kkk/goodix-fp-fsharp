@@ -1,0 +1,21 @@
+# Build and Artifacts
+bin/
+obj/
+BenchmarkDotNet.Artifacts/
+
+# Binary blobs and packages
+*.so
+*.so.*
+*.deb
+
+# Images and captures
+*.pgm
+*.png
+*.ppm
+
+# IDE / OS files
+.vscode/
+.idea/
+*.user
+*.suo
+.DS_Store
