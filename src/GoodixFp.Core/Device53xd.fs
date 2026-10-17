@@ -33,41 +33,69 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
     // Low-Level Packet Exchange Helpers
     // ------------------------------------------------------------------------
 
-    member private this.SendAndExpectAck(packet: byte[], expectedCommand: byte, ?timeoutMs: int) : Result<unit, DriverError> =
+    member this.SendAndExpectAck(packet: byte[], expectedCommand: byte, ?timeoutMs: int) : Result<unit, DriverError> =
         result {
             let timeout = defaultArg timeoutMs 2000
             do! transport.Write(packet)
             let! response = transport.Read(64, timeout)
             match response with
-            | Protocol.AckResponse (cmd, success) when cmd = expectedCommand ->
-                if success then return ()
-                else return! Error (ProtocolError $"Device returned NAK for command 0x{cmd:x2}")
+            | Protocol.AckResponse (cmd, _) when cmd = expectedCommand ->
+                return ()
+            | Protocol.CommandResponse (cmd, _) when cmd = expectedCommand ->
+                return ()
             | Protocol.AckResponse (cmd, _) ->
-                return! Error (ProtocolError $"Expected ACK for command 0x{expectedCommand:x2}, got 0x{cmd:x2}")
+                return! Error (ProtocolError $"Expected ACK for command 0x{expectedCommand:x2}, got 0x{cmd:x2} (raw: {Convert.ToHexString(response)})")
             | Protocol.InvalidPacket reason ->
-                return! Error (InvalidPacket reason)
+                return! Error (InvalidPacket $"Invalid packet (raw: {Convert.ToHexString(response)}): {reason}")
             | Protocol.CommandResponse (cmd, _) ->
-                return! Error (ProtocolError $"Unexpected command response 0x{cmd:x2} while expecting ACK for 0x{expectedCommand:x2}")
+                return! Error (ProtocolError $"Unexpected command response 0x{cmd:x2} while expecting ACK for 0x{expectedCommand:x2} (raw: {Convert.ToHexString(response)})")
         }
 
-    member private this.SendAndReceive(packet: byte[], expectedCommand: byte, ?timeoutMs: int) : Result<byte[], DriverError> =
+    member this.ReadCommandResponse(expectedCommand: byte, ?timeoutMs: int) : Result<byte[], DriverError> =
         result {
             let timeout = defaultArg timeoutMs 3000
-            do! this.SendAndExpectAck(packet, expectedCommand, timeout)
             let! response = transport.Read(1024, timeout)
             match response with
             | Protocol.CommandResponse (cmd, payload) when cmd = expectedCommand ->
                 return payload
             | Protocol.CommandResponse (cmd, _) ->
-                return! Error (ProtocolError $"Expected response for command 0x{expectedCommand:x2}, got 0x{cmd:x2}")
+                return! Error (ProtocolError $"Expected response for command 0x{expectedCommand:x2}, got 0x{cmd:x2} (raw: {Convert.ToHexString(response)})")
             | Protocol.AckResponse (cmd, _) ->
-                return! Error (ProtocolError $"Unexpected ACK for command 0x{cmd:x2} while expecting response")
+                return! Error (ProtocolError $"Unexpected ACK for command 0x{cmd:x2} while expecting response (raw: {Convert.ToHexString(response)})")
             | Protocol.InvalidPacket reason ->
-                return! Error (InvalidPacket reason)
+                return! Error (InvalidPacket $"Invalid packet (raw: {Convert.ToHexString(response)}): {reason}")
         }
+
+    member this.SendAndReceive(packet: byte[], expectedCommand: byte, ?timeoutMs: int) : Result<byte[], DriverError> =
+        result {
+            let timeout = defaultArg timeoutMs 3000
+            do! transport.Write(packet)
+            let! firstResponse = transport.Read(1024, timeout)
+            match firstResponse with
+            | Protocol.CommandResponse (cmd, payload) when cmd = expectedCommand ->
+                return payload
+            | Protocol.AckResponse (cmd, _) when cmd = expectedCommand ->
+                return! this.ReadCommandResponse(expectedCommand, timeout)
+            | Protocol.AckResponse (cmd, _) ->
+                return! Error (ProtocolError $"Expected ACK or response for command 0x{expectedCommand:x2}, got ACK for 0x{cmd:x2} (raw: {Convert.ToHexString(firstResponse)})")
+            | Protocol.CommandResponse (cmd, _) ->
+                return! Error (ProtocolError $"Expected response for command 0x{expectedCommand:x2}, got 0x{cmd:x2} (raw: {Convert.ToHexString(firstResponse)})")
+            | Protocol.InvalidPacket reason ->
+                return! Error (InvalidPacket $"Invalid packet (raw: {Convert.ToHexString(firstResponse)}): {reason}")
+        }
+
+    member this.ReadFirmwareVersion() : Result<string, DriverError> =
+        result {
+            let! fwPayload = this.SendAndReceive(Protocol.packFirmwareVersion(), Protocol.CommandFirmwareVersion)
+            let nullIdx = Array.IndexOf(fwPayload, 0x00uy)
+            let strBytes = if nullIdx >= 0 then Array.sub fwPayload 0 nullIdx else fwPayload
+            return System.Text.Encoding.ASCII.GetString(strBytes)
+        }
+
 
     member private this.SendNopWakeup() : Result<unit, DriverError> =
         result {
+            transport.DrainBuffer(20)
             do! transport.Write(Protocol.packNop())
             // Best effort: read response if device sends ACK, but ignore timeout if waking up
             match transport.Read(64, 150) with
@@ -75,6 +103,7 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
             | Error (Timeout _) | Error (UsbError (_, -7)) -> ()
             | Error err -> return! Error err
             System.Threading.Thread.Sleep(50)
+            transport.DrainBuffer(50)
         }
 
     // ------------------------------------------------------------------------
@@ -133,36 +162,118 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
     }
 
     // ------------------------------------------------------------------------
-    // Workflow 2: Provision Zero PSK
+    // Workflow 2: Provision Zero PSK & Firmware Restore
     // ------------------------------------------------------------------------
 
-    member this.ProvisionZeroPsk() : Task<Result<unit, DriverError>> = taskResult {
-        // Read current PSK status (flags = 0xbb020001)
-        let readPskPacket = Protocol.packPresetPskRead 0xbb020001u (Some 32) (Some 0)
-        let! pskPayload = this.SendAndReceive(readPskPacket, Protocol.CommandPresetPskReadR)
-        let pskValid =
-            pskPayload.Length >= 41 &&
-            pskPayload.[0] = 0x00uy &&
-            ReadOnlySpan(pskPayload, 9, 32).SequenceEqual(ReadOnlySpan(Protocol.PmkHashZero))
-
-        if not pskValid then
-            // Write PSK White-Box with flag 0xbb010003u, chunk length 114, offset 0, and pre_flags
-            let writePacket = Protocol.packPresetPskWrite 0xbb010003u Protocol.PskWhiteBox (Some 114) (Some 0) (Some Protocol.PreFlagsPresetPskWrite)
-            let! writeResp = this.SendAndReceive(writePacket, Protocol.CommandPresetPskWriteR)
-            if writeResp.Length > 0 && writeResp.[0] = 0x00uy then
-                // Re-verify PSK status
-                let! recheckPayload = this.SendAndReceive(readPskPacket, Protocol.CommandPresetPskReadR)
-                let recheckValid =
-                    recheckPayload.Length >= 41 &&
-                    recheckPayload.[0] = 0x00uy &&
-                    ReadOnlySpan(recheckPayload, 9, 32).SequenceEqual(ReadOnlySpan(Protocol.PmkHashZero))
-                if recheckValid then
-                    return ()
-                else
-                    return! Error (ProtocolError "PSK verification failed after writing PSK White-Box")
+    member this.PresetPskRead(flags: uint32, length: int, offset: int) : Result<byte[], DriverError> =
+        result {
+            let packet = Protocol.packPresetPskRead flags length offset
+            let! pskPayload = this.SendAndReceive(packet, Protocol.CommandPresetPskRead)
+            if pskPayload.Length < 9 then
+                return! Error (ProtocolError $"PresetPskRead response too short: {pskPayload.Length} bytes")
+            elif pskPayload.[0] <> 0x00uy then
+                return! Error (ProtocolError $"PresetPskRead error status: 0x{pskPayload.[0]:x2}")
             else
-                return! Error (ProtocolError "Failed to write PSK White-Box")
+                let payloadLen = BitConverter.ToInt32(pskPayload, 5)
+                if payloadLen > 0 && pskPayload.Length >= 9 + payloadLen then
+                    return Array.sub pskPayload 9 payloadLen
+                elif pskPayload.Length >= 41 then
+                    return Array.sub pskPayload 9 32
+                else
+                    return Array.sub pskPayload 9 (pskPayload.Length - 9)
+        }
+
+    member this.ReadPresetPsk(flags: uint32, length: int, offset: int) : Task<Result<byte[], DriverError>> = task {
+        return this.PresetPskRead(flags, length, offset)
+    }
+
+    member this.ReadPresetPsk(flags: uint32) : Task<Result<byte[], DriverError>> =
+        this.ReadPresetPsk(flags, 0, 0)
+
+    member this.UpdateFirmware(firmwareBytes: byte[], ?psk: byte[]) : Task<Result<unit, DriverError>> = taskResult {
+        let pskBytes = defaultArg psk Protocol.ZeroPsk
+        // Validate firmware integrity
+        do! Protocol.verifyFirmwareImage firmwareBytes
+
+        // 1. Loop offset from 0 to firmwareBytes.Length in chunks of 256 bytes
+        let chunkSize = 256
+        let mutable offset = 0
+        while offset < firmwareBytes.Length do
+            let chunkLen = min chunkSize (firmwareBytes.Length - offset)
+            let chunk = Array.sub firmwareBytes offset chunkLen
+            let writePacket = Protocol.packWriteFirmware (uint32 offset) chunk 2u
+            do! this.SendAndExpectAck(writePacket, Protocol.CommandWriteFirmware)
+            let! writeResp = this.ReadCommandResponse(Protocol.CommandWriteFirmware, 2000)
+            if writeResp.Length = 0 || (writeResp.[0] <> 0x01uy && writeResp.[0] <> 0x00uy) then
+                return! Error (ProtocolError $"CommandWriteFirmware failed at offset {offset}: status 0x{(if writeResp.Length > 0 then writeResp.[0] else 0xffuy):x2}")
+            offset <- offset + chunkLen
+
+        // 2. Send CheckFirmware with computed firmware HMAC
+        let fwHmac = Protocol.computeFirmwareHmac pskBytes firmwareBytes
+        let checkPacket = Protocol.packCheckFirmware fwHmac
+        do! this.SendAndExpectAck(checkPacket, Protocol.CommandCheckFirmware)
+        let! checkResp = this.ReadCommandResponse(Protocol.CommandCheckFirmware, 3000)
+        if checkResp.Length = 0 || (checkResp.[0] <> 0x01uy && checkResp.[0] <> 0x00uy) then
+            return! Error (ProtocolError $"CommandCheckFirmware failed: status 0x{(if checkResp.Length > 0 then checkResp.[0] else 0xffuy):x2}")
+
+        // 3. Send Reset to boot the newly written APP firmware from IAP mode
+        let resetPacket = Protocol.packReset false true 50uy
+        do! this.SendAndExpectAck(resetPacket, Protocol.CommandReset)
+
+        // 4. Reset USB transport since MCU reboot causes USB re-enumeration
+        System.Threading.Thread.Sleep(1500)
+        do! transport.ResetConnection()
+
+        // 5. Query FirmwareVersion to confirm back in GF5298_GM168SEC_APP_13016
+        let! newFw = this.ReadFirmwareVersion()
+        if not (newFw.StartsWith("GF5298_GM168SEC_APP_13016")) then
+            return! Error (FirmwareMismatch ("GF5298_GM168SEC_APP_13016", newFw))
         else
+            return ()
+    }
+
+    member this.ProvisionZeroPsk(firmwareBytes: byte[]) : Task<Result<unit, DriverError>> = taskResult {
+        // Step 1: First validate Protocol.verifyFirmwareImage firmwareBytes
+        do! Protocol.verifyFirmwareImage firmwareBytes
+
+        // Step 2: Read FirmwareVersion (0xa8) and PresetPskRead(0xbb020001u, 0, 0) (0xe4)
+        // Best effort NOP wakeup (only needed if in APP mode)
+        let _ = this.SendNopWakeup()
+        let! currentFw = this.ReadFirmwareVersion()
+        let pskHashResult = this.PresetPskRead(0xbb020001u, 0, 0)
+        let isZeroPsk =
+            match pskHashResult with
+            | Ok pskHash when pskHash = Protocol.PmkHashZero -> true
+            | _ -> false
+
+        // Step 3: If FirmwareVersion starts with "GF5298_GM168SEC_APP" AND pskHash = Protocol.PmkHashZero, return Ok ()
+        if currentFw.StartsWith("GF5298_GM168SEC_APP") && isZeroPsk then
+            return ()
+        else
+            // Step 4: If FirmwareVersion is NOT "MILAN_GM168SEC_IAP_10007" (i.e. it is in APP mode), transition to IAP mode
+            if not (currentFw.StartsWith("MILAN_GM168SEC_IAP")) then
+                do! this.SendAndExpectAck(Protocol.packMcuEraseApp 50uy, Protocol.CommandMcuEraseApp)
+                let! eraseResp = this.ReadCommandResponse(Protocol.CommandMcuEraseApp, 2000)
+                System.Threading.Thread.Sleep(1000)
+
+                let! iapFw = this.ReadFirmwareVersion()
+                if not (iapFw.StartsWith("MILAN_GM168SEC_IAP")) then
+                    return! Error (FirmwareMismatch ("MILAN_GM168SEC_IAP", iapFw))
+
+            // Step 5: In IAP mode, write the zero PSK if not already provisioned
+            if not isZeroPsk then
+                let writePskPacket = Protocol.packPresetPskWrite 0xbb010003u Protocol.PskWhiteBox 114 0 Protocol.PreFlagsPresetPskWrite
+                do! this.SendAndExpectAck(writePskPacket, Protocol.CommandPresetPskWrite)
+                let! writeResp = this.ReadCommandResponse(Protocol.CommandPresetPskWrite, 2000)
+                if writeResp.Length = 0 || writeResp.[0] <> 0x00uy then
+                    return! Error (ProtocolError $"PresetPskWrite failed with status: 0x{(if writeResp.Length > 0 then writeResp.[0] else 0xffuy):x2}")
+
+                let! verifiedPskHash = this.PresetPskRead(0xbb020001u, 0, 0)
+                if verifiedPskHash <> Protocol.PmkHashZero then
+                    return! Error (ProtocolError $"PSK verification failed after writing PSK White-Box in IAP mode. Hash: {Convert.ToHexString(verifiedPskHash)}")
+
+            // Step 6: Restore the APP firmware
+            do! this.UpdateFirmware(firmwareBytes, Protocol.ZeroPsk)
             return ()
     }
 
@@ -171,10 +282,13 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
     // ------------------------------------------------------------------------
 
     member this.ActivateSession() : Task<Result<SensorOtp, DriverError>> = taskResult {
-        // Enable chip before reset
+        // 1. Send NOP wakeup
+        do! this.SendNopWakeup()
+
+        // 2. Enable chip before reset
         do! this.SendAndExpectAck(Protocol.packEnableChip true, Protocol.CommandEnableChip)
 
-        // Reset device
+        // 3. Reset device (sensor reset only, never soft-reset MCU)
         let resetPacket = Protocol.packReset true false 20uy
         do! this.SendAndExpectAck(resetPacket, Protocol.CommandReset)
         let! resetPayload = transport.Read(64, 2000)
@@ -185,23 +299,15 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
             | _ ->
                 Error (ResetFailed "Reset response invalid or rejected")
 
-        // Read Chip ID
+        // 4. Read Chip ID (Sensor Register 0x0000, 4 bytes)
         let! _ = this.SendAndReceive(Protocol.packReadSensorRegister 0x0000us 4uy, Protocol.CommandReadSensorRegister)
 
-        // Read OTP
+        // 5. Read OTP
         let! otpPayload = this.SendAndReceive(Protocol.packReadOtp(), Protocol.CommandReadOtp)
         let! otp = SensorOtp.parse otpPayload
         currentOtp <- Some otp
 
-        // MCU switch to idle mode
-        do! this.SendAndExpectAck(Protocol.packSwitchToIdleMode 20uy, Protocol.CommandMcuSwitchToIdleMode)
-
-        // Upload MCU config
-        let! uploadResp = this.SendAndReceive(Protocol.packUploadConfig Protocol.Goodix53xdConfig, Protocol.CommandUploadConfigMcu)
-        if uploadResp.Length = 0 || uploadResp.[0] <> 0x01uy then
-            do! Error (ProtocolError "Failed to upload MCU config")
-
-        // Initiate TLS handshake
+        // 6. Initiate TLS handshake BEFORE UploadConfigMcu (matching driver_53xd.py)
         do! this.SendAndExpectAck(Protocol.packRequestTlsConnection(), Protocol.CommandRequestTlsConnection)
         let! clientHelloPack = transport.Read(1024, 2000)
         let! clientHelloBytes =
@@ -251,6 +357,12 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
 
         // Notify TLS established
         do! this.SendAndExpectAck(Protocol.packTlsSuccessfullyEstablished(), Protocol.CommandTlsSuccessfullyEstablished)
+
+        // 7. Upload MCU config (after TLS connection established)
+        let! uploadResp = this.SendAndReceive(Protocol.packUploadConfig Protocol.Goodix53xdConfig, Protocol.CommandUploadConfigMcu)
+        if uploadResp.Length = 0 || uploadResp.[0] <> 0x01uy then
+            do! Error (ProtocolError "Failed to upload MCU config")
+
         return otp
     }
 

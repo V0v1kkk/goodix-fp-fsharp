@@ -125,6 +125,25 @@ let ``GoodixFrameCrc correctly verifies valid and corrupted frame`` () =
     | Error (ChecksumMismatch _) -> ()
     | res -> Assert.Fail($"Expected ChecksumMismatch, got {res}")
 
+[<Fact>]
+let ``GoodixFrameCrc verifies live Goodix hardware word-swapped MPEG2 frame CRC`` () =
+    let data = Array.init GoodixFrameCrc.FrameDataLength (fun i -> byte (i &&& 0xff))
+    let crc = Crc32.goodixCrc32 data
+    let b0 = byte (crc >>> 8)
+    let b1 = byte crc
+    let b2 = byte (crc >>> 24)
+    let b3 = byte (crc >>> 16)
+    let frame = Array.concat [ data; [| b0; b1; b2; b3 |] ]
+    match GoodixFrameCrc.verify (ReadOnlySpan frame) with
+    | Ok () -> ()
+    | Error err -> Assert.Fail($"Goodix hardware frame verification failed: {err}")
+
+    // Corrupt one byte
+    frame.[0] <- frame.[0] ^^^ 0x01uy
+    match GoodixFrameCrc.verify (ReadOnlySpan frame) with
+    | Error (ChecksumMismatch _) -> ()
+    | res -> Assert.Fail($"Expected ChecksumMismatch, got {res}")
+
 // ============================================================================
 // Protocol Packet & Active Pattern Tests
 // ============================================================================
@@ -401,6 +420,8 @@ type MockUsbTransport() =
                 Ok (responses.Dequeue())
             else
                 Error (Timeout "Mock transport queue empty")
+        member _.DrainBuffer(?timeoutMs: int) = ()
+        member _.ResetConnection() = Ok ()
         member _.Dispose() = ()
 
 [<Fact>]
@@ -762,40 +783,233 @@ let ``PureFSharpTlsPskTunnel and BouncyCastle decrypt concatenated multi-record 
     | Ok decrypted -> Assert.Equal<byte seq>(chunk1, decrypted)
     | Error err -> Assert.Fail($"13-byte wrapped decryption failed: {err}")
 
+let private createValidTestFirmware () : byte[] =
+    let payload = Array.init 24256 (fun i -> byte (i &&& 0xff))
+    let codeCrc = Crc32.goodixCrc32 payload
+    let hdrTail = Array.concat [ BitConverter.GetBytes(24256u); BitConverter.GetBytes(codeCrc) ]
+    let hdrCrc = Crc32.goodixCrc32 hdrTail
+    Array.concat [ BitConverter.GetBytes(hdrCrc); hdrTail; payload ]
+
 [<Fact>]
-let ``Goodix53xdDevice ProvisionZeroPsk validates PMK_HASH and writes PSK White-Box when needed`` () =
+let ``Protocol verifyFirmwareImage validates header and payload Goodix CRC32 correctly`` () =
+    let fw = createValidTestFirmware ()
+    match Protocol.verifyFirmwareImage fw with
+    | Ok () -> ()
+    | Error err -> Assert.Fail($"Valid firmware failed verification: {err}")
+
+    // Truncated firmware
+    let shortFw = Array.zeroCreate 100
+    match Protocol.verifyFirmwareImage shortFw with
+    | Error (ValidationError ("FirmwareImage", _)) -> ()
+    | other -> Assert.Fail($"Expected ValidationError for short firmware, got: {other}")
+
+    // Corrupted header CRC
+    let badHdrCrc = Array.copy fw
+    badHdrCrc.[0] <- badHdrCrc.[0] ^^^ 0xffuy
+    match Protocol.verifyFirmwareImage badHdrCrc with
+    | Error (ChecksumMismatch _) -> ()
+    | other -> Assert.Fail($"Expected ChecksumMismatch for corrupted header CRC, got: {other}")
+
+    // Corrupted payload length
+    let badLen = Array.copy fw
+    badLen.[4] <- badLen.[4] ^^^ 0x01uy
+    // Recompute header CRC over corrupted 4..11 so we reach payload length check
+    let newHdrCrc = Crc32.goodixCrc32 badLen.[4..11]
+    Array.Copy(BitConverter.GetBytes(newHdrCrc), 0, badLen, 0, 4)
+    match Protocol.verifyFirmwareImage badLen with
+    | Error (ValidationError ("FirmwarePayloadLength", _)) -> ()
+    | other -> Assert.Fail($"Expected ValidationError for corrupted payload length, got: {other}")
+
+    // Corrupted code CRC
+    let badCodeCrc = Array.copy fw
+    badCodeCrc.[8] <- badCodeCrc.[8] ^^^ 0xffuy
+    let newHdrCrc2 = Crc32.goodixCrc32 badCodeCrc.[4..11]
+    Array.Copy(BitConverter.GetBytes(newHdrCrc2), 0, badCodeCrc, 0, 4)
+    match Protocol.verifyFirmwareImage badCodeCrc with
+    | Error (ChecksumMismatch _) -> ()
+    | other -> Assert.Fail($"Expected ChecksumMismatch for corrupted code CRC, got: {other}")
+
+[<Fact>]
+let ``Protocol packMcuEraseApp, packWriteFirmware, packCheckFirmware produce correct packets`` () =
+    // 1. packMcuEraseApp
+    let erasePacket = Protocol.packMcuEraseApp 50uy
+    match erasePacket with
+    | Protocol.MessagePack (flags, inner) ->
+        Assert.Equal(Protocol.FlagsMessageProtocol, flags)
+        match inner with
+        | Protocol.MessageProtocol (cmd, payload) ->
+            Assert.Equal(Protocol.CommandMcuEraseApp, cmd)
+            Assert.Equal<byte seq>([| 0x00uy; 50uy |], payload)
+        | _ -> Assert.Fail("Failed to decode inner MessageProtocol for McuEraseApp")
+    | _ -> Assert.Fail("Failed to decode MessagePack for McuEraseApp")
+
+    // 2. packWriteFirmware
+    let payload = [| 0x11uy; 0x22uy; 0x33uy; 0x44uy |]
+    let writePacket = Protocol.packWriteFirmware 512u payload 2u
+    match writePacket with
+    | Protocol.MessagePack (flags, inner) ->
+        Assert.Equal(Protocol.FlagsMessageProtocol, flags)
+        match inner with
+        | Protocol.MessageProtocol (cmd, innerPayload) ->
+            Assert.Equal(Protocol.CommandWriteFirmware, cmd)
+            Assert.Equal(16, innerPayload.Length) // 4B offset + 4B len + 4B number + 4B payload
+            Assert.Equal(512u, BitConverter.ToUInt32(innerPayload, 0))
+            Assert.Equal(4u, BitConverter.ToUInt32(innerPayload, 4))
+            Assert.Equal(2u, BitConverter.ToUInt32(innerPayload, 8))
+            Assert.Equal<byte seq>(payload, Array.sub innerPayload 12 4)
+        | _ -> Assert.Fail("Failed to decode inner MessageProtocol for WriteFirmware")
+    | _ -> Assert.Fail("Failed to decode MessagePack for WriteFirmware")
+
+    // 3. packCheckFirmware
+    let hmac = Array.zeroCreate 32
+    let checkPacket = Protocol.packCheckFirmware hmac
+    match checkPacket with
+    | Protocol.MessagePack (flags, inner) ->
+        Assert.Equal(Protocol.FlagsMessageProtocol, flags)
+        match inner with
+        | Protocol.MessageProtocol (cmd, innerPayload) ->
+            Assert.Equal(Protocol.CommandCheckFirmware, cmd)
+            Assert.Equal<byte seq>(hmac, innerPayload)
+        | _ -> Assert.Fail("Failed to decode inner MessageProtocol for CheckFirmware")
+    | _ -> Assert.Fail("Failed to decode MessagePack for CheckFirmware")
+
+[<Fact>]
+let ``Protocol computeFirmwareHmac produces valid 32-byte HMAC for zero PSK`` () =
+    let psk = Protocol.ZeroPsk
+    let fwBytes = createValidTestFirmware ()
+    let hmac = Protocol.computeFirmwareHmac psk fwBytes
+    Assert.Equal(32, hmac.Length)
+    Assert.False(Array.forall ((=) 0uy) hmac)
+
+[<Fact>]
+let ``Goodix53xdDevice ProvisionZeroPsk returns Ok immediately when already in APP mode with zero PSK`` () =
     task {
         let mockTransport = new MockUsbTransport()
+        let fwBytes = createValidTestFirmware ()
 
-        // 1. Initial PSK read returns invalid (all zeros, not matching PmkHashZero)
-        let ackRead = Protocol.encodeMessagePack Protocol.FlagsMessageProtocol (Protocol.encodeMessageProtocol Protocol.CommandAck [| Protocol.CommandPresetPskReadR; 0x03uy |] true)
-        mockTransport.EnqueueResponse(ackRead)
-        let unprovPskPayload = Array.zeroCreate 45 // status=0, flags=0, hash=all zeros
-        let respRead = Protocol.encodeMessagePack Protocol.FlagsMessageProtocol (Protocol.encodeMessageProtocol Protocol.CommandPresetPskReadR unprovPskPayload true)
-        mockTransport.EnqueueResponse(respRead)
+        let enqueueAckAndResp (cmd: byte) (payload: byte[]) =
+            let ack = Protocol.encodeMessagePack Protocol.FlagsMessageProtocol (Protocol.encodeMessageProtocol Protocol.CommandAck [| cmd; 0x03uy |] true)
+            let resp = Protocol.encodeMessagePack Protocol.FlagsMessageProtocol (Protocol.encodeMessageProtocol cmd payload true)
+            mockTransport.EnqueueResponse(ack)
+            mockTransport.EnqueueResponse(resp)
 
-        // 2. Write PSK White-Box -> ACK, then CommandResponse (status=0)
-        let ackWrite = Protocol.encodeMessagePack Protocol.FlagsMessageProtocol (Protocol.encodeMessageProtocol Protocol.CommandAck [| Protocol.CommandPresetPskWriteR; 0x03uy |] true)
-        mockTransport.EnqueueResponse(ackWrite)
-        let respWrite = Protocol.encodeMessagePack Protocol.FlagsMessageProtocol (Protocol.encodeMessageProtocol Protocol.CommandPresetPskWriteR [| 0x00uy |] true)
-        mockTransport.EnqueueResponse(respWrite)
+        // 1. NOP ACK
+        let ackNop = Protocol.encodeMessagePack Protocol.FlagsMessageProtocol (Protocol.encodeMessageProtocol Protocol.CommandAck [| Protocol.CommandNop; 0x03uy |] true)
+        mockTransport.EnqueueResponse(ackNop)
 
-        // 3. Re-read PSK status -> ACK, then CommandResponse with valid PmkHashZero at [9..40]
-        mockTransport.EnqueueResponse(ackRead)
+        // 2. ReadFirmwareVersion -> APP firmware
+        enqueueAckAndResp Protocol.CommandFirmwareVersion (System.Text.Encoding.ASCII.GetBytes("GF5298_GM168SEC_APP_13016\u0000"))
+
+        // 3. PresetPskRead -> PmkHashZero
         let validPskPayload = Array.zeroCreate 45
         validPskPayload.[0] <- 0x00uy
+        Array.Copy(BitConverter.GetBytes(0xbb020001u), 0, validPskPayload, 1, 4)
+        Array.Copy(BitConverter.GetBytes(32), 0, validPskPayload, 5, 4)
         Array.Copy(Protocol.PmkHashZero, 0, validPskPayload, 9, 32)
-        let respValidRead = Protocol.encodeMessagePack Protocol.FlagsMessageProtocol (Protocol.encodeMessageProtocol Protocol.CommandPresetPskReadR validPskPayload true)
-        mockTransport.EnqueueResponse(respValidRead)
+        enqueueAckAndResp Protocol.CommandPresetPskRead validPskPayload
 
         use dev = new Goodix53xdDevice(mockTransport)
-        let! provRes = dev.ProvisionZeroPsk()
+        let! provRes = dev.ProvisionZeroPsk(fwBytes)
 
         match provRes with
         | Ok () ->
-            // Verify that writePacket was sent with CommandPresetPskWriteR
-            Assert.True(mockTransport.WrittenPackets.Length >= 2)
+            // Ensure no McuEraseApp or WriteFirmware packets were sent!
+            let commands =
+                mockTransport.WrittenPackets
+                |> Array.choose (fun p ->
+                    match p with
+                    | Protocol.MessagePack (_, inner) ->
+                        match inner with
+                        | Protocol.MessageProtocol (cmd, _) -> Some cmd
+                        | _ -> None
+                    | _ -> None)
+            Assert.DoesNotContain(Protocol.CommandMcuEraseApp, commands)
+            Assert.DoesNotContain(Protocol.CommandWriteFirmware, commands)
         | Error err -> Assert.Fail($"ProvisionZeroPsk failed: {err}")
+    }
+
+[<Fact>]
+let ``Goodix53xdDevice ProvisionZeroPsk executes full IAP -> PSK write -> Firmware write -> APP boot sequence`` () =
+    task {
+        let mockTransport = new MockUsbTransport()
+        let fwBytes = createValidTestFirmware ()
+
+        let enqueueAckAndResp (cmd: byte) (payload: byte[]) =
+            let ack = Protocol.encodeMessagePack Protocol.FlagsMessageProtocol (Protocol.encodeMessageProtocol Protocol.CommandAck [| cmd; 0x03uy |] true)
+            let resp = Protocol.encodeMessagePack Protocol.FlagsMessageProtocol (Protocol.encodeMessageProtocol cmd payload true)
+            mockTransport.EnqueueResponse(ack)
+            mockTransport.EnqueueResponse(resp)
+
+        let enqueueAckOnly (cmd: byte) =
+            let ack = Protocol.encodeMessagePack Protocol.FlagsMessageProtocol (Protocol.encodeMessageProtocol Protocol.CommandAck [| cmd; 0x03uy |] true)
+            mockTransport.EnqueueResponse(ack)
+
+        // 1. NOP ACK
+        let ackNop = Protocol.encodeMessagePack Protocol.FlagsMessageProtocol (Protocol.encodeMessageProtocol Protocol.CommandAck [| Protocol.CommandNop; 0x03uy |] true)
+        mockTransport.EnqueueResponse(ackNop)
+
+        // 2. ReadFirmwareVersion (initial check: in APP mode)
+        enqueueAckAndResp Protocol.CommandFirmwareVersion (System.Text.Encoding.ASCII.GetBytes("GF5298_GM168SEC_APP_13016\u0000"))
+
+        // 3. PresetPskRead (initial check: non-zero factory hash)
+        let nonZeroPskPayload = Array.zeroCreate 45
+        nonZeroPskPayload.[0] <- 0x00uy
+        Array.Copy(BitConverter.GetBytes(0xbb020001u), 0, nonZeroPskPayload, 1, 4)
+        Array.Copy(BitConverter.GetBytes(32), 0, nonZeroPskPayload, 5, 4)
+        Array.Copy(Array.create 32 0x77uy, 0, nonZeroPskPayload, 9, 32)
+        enqueueAckAndResp Protocol.CommandPresetPskRead nonZeroPskPayload
+
+        // 4. McuEraseApp (0xa4) -> ACK, then response [0x01]
+        enqueueAckAndResp Protocol.CommandMcuEraseApp [| 0x01uy |]
+
+        // 5. ReadFirmwareVersion (after erase: in IAP mode)
+        enqueueAckAndResp Protocol.CommandFirmwareVersion (System.Text.Encoding.ASCII.GetBytes("MILAN_GM168SEC_IAP_10007\u0000"))
+
+        // 6. PresetPskWrite (0xe0) -> ACK, then response [0x00]
+        enqueueAckAndResp Protocol.CommandPresetPskWrite [| 0x00uy |]
+
+        // 7. PresetPskRead (verify zero PSK in IAP mode)
+        let zeroPskPayload = Array.zeroCreate 45
+        zeroPskPayload.[0] <- 0x00uy
+        Array.Copy(BitConverter.GetBytes(0xbb020001u), 0, zeroPskPayload, 1, 4)
+        Array.Copy(BitConverter.GetBytes(32), 0, zeroPskPayload, 5, 4)
+        Array.Copy(Protocol.PmkHashZero, 0, zeroPskPayload, 9, 32)
+        enqueueAckAndResp Protocol.CommandPresetPskRead zeroPskPayload
+
+        // 8. UpdateFirmware: 95 chunks of WriteFirmware (0xf0)
+        let totalChunks = (fwBytes.Length + 255) / 256
+        for _ in 1 .. totalChunks do
+            enqueueAckAndResp Protocol.CommandWriteFirmware [| 0x00uy |]
+
+        // 9. CheckFirmware (0xf4) -> ACK, then response [0x00]
+        enqueueAckAndResp Protocol.CommandCheckFirmware [| 0x00uy |]
+
+        // 10. Reset (0xa2) -> ACK only
+        enqueueAckOnly Protocol.CommandReset
+
+        // 11. ReadFirmwareVersion (after reset: back in APP mode)
+        enqueueAckAndResp Protocol.CommandFirmwareVersion (System.Text.Encoding.ASCII.GetBytes("GF5298_GM168SEC_APP_13016\u0000"))
+
+        use dev = new Goodix53xdDevice(mockTransport)
+        let! provRes = dev.ProvisionZeroPsk(fwBytes)
+
+        match provRes with
+        | Ok () ->
+            let commands =
+                mockTransport.WrittenPackets
+                |> Array.choose (fun p ->
+                    match p with
+                    | Protocol.MessagePack (_, inner) ->
+                        match inner with
+                        | Protocol.MessageProtocol (cmd, _) -> Some cmd
+                        | _ -> None
+                    | _ -> None)
+            Assert.Contains(Protocol.CommandMcuEraseApp, commands)
+            Assert.Contains(Protocol.CommandPresetPskWrite, commands)
+            Assert.Contains(Protocol.CommandWriteFirmware, commands)
+            Assert.Contains(Protocol.CommandCheckFirmware, commands)
+            Assert.Contains(Protocol.CommandReset, commands)
+        | Error err -> Assert.Fail($"ProvisionZeroPsk full sequence failed: {err}")
     }
 
 

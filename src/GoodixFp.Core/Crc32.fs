@@ -50,6 +50,32 @@ module Crc32 =
             byte (crc >>> 24)
         |]
 
+    /// Precomputed MPEG-2 / POSIX MSB-first polynomial 0x04C11DB7 table for Goodix firmware integrity
+    let private GoodixTable: uint32[] =
+        let poly = 0x04C11DB7u
+        Array.init 256 (fun i ->
+            let mutable r = uint32 i <<< 24
+            for _ in 0 .. 7 do
+                if (r &&& 0x80000000u) <> 0u then
+                    r <- (r <<< 1) ^^^ poly
+                else
+                    r <- r <<< 1
+            r)
+
+    /// Computes Goodix firmware CRC-32 (MPEG-2 / 0x04C11DB7, MSB-first, initial 0xFFFFFFFF, no final inversion) over a byte span.
+    let goodixCrc32Span (data: ReadOnlySpan<byte>) : uint32 =
+        let mutable crc = 0xFFFFFFFFu
+        for i in 0 .. data.Length - 1 do
+            let b = data.[i]
+            let idx = int (((crc >>> 24) ^^^ uint32 b) &&& 0xFFu)
+            crc <- (crc <<< 8) ^^^ GoodixTable.[idx]
+        crc
+
+    /// Computes Goodix firmware CRC-32 over a byte array.
+    let goodixCrc32 (data: byte[]) : uint32 =
+        if isNull data then 0xFFFFFFFFu
+        else goodixCrc32Span (ReadOnlySpan data)
+
 module GoodixFrameCrc =
 
     [<Literal>]
@@ -60,22 +86,28 @@ module GoodixFrameCrc =
 
     /// Verifies the 7,684-byte Goodix frame payload where the first 7,680 bytes
     /// are 12-bit packed sensor pixel data and the last 4 bytes are CRC32.
+    /// Goodix hardware uses MPEG-2 polynomial (0x04C11DB7) with 16-bit word-swapped endianness.
+    /// Standard Ethernet/ZIP CRC32 is also accepted for backward compatibility.
     let verify (frameBytes: ReadOnlySpan<byte>) : Result<unit, DriverError> =
         if frameBytes.Length < FrameTotalLength then
             Error (ValidationError ("GoodixFrameCrc", $"Frame length {frameBytes.Length} is less than required {FrameTotalLength}"))
         else
             let dataSlice = frameBytes.Slice(0, FrameDataLength)
-            let computed = Crc32.compute dataSlice
-
             let b0 = uint32 frameBytes.[FrameDataLength]
             let b1 = uint32 frameBytes.[FrameDataLength + 1]
             let b2 = uint32 frameBytes.[FrameDataLength + 2]
             let b3 = uint32 frameBytes.[FrameDataLength + 3]
 
+            let wordSwappedReceived = (b2 <<< 24) ||| (b3 <<< 16) ||| (b0 <<< 8) ||| b1
             let bigEndianReceived = (b0 <<< 24) ||| (b1 <<< 16) ||| (b2 <<< 8) ||| b3
             let littleEndianReceived = b0 ||| (b1 <<< 8) ||| (b2 <<< 16) ||| (b3 <<< 24)
 
-            if computed = bigEndianReceived || computed = littleEndianReceived then
+            let goodixCrc = Crc32.goodixCrc32Span dataSlice
+            if goodixCrc = wordSwappedReceived || goodixCrc = bigEndianReceived || goodixCrc = littleEndianReceived then
                 Ok ()
             else
-                Error (ChecksumMismatch (computed, bigEndianReceived))
+                let stdCrc = Crc32.compute dataSlice
+                if stdCrc = bigEndianReceived || stdCrc = littleEndianReceived || stdCrc = wordSwappedReceived then
+                    Ok ()
+                else
+                    Error (ChecksumMismatch (goodixCrc, wordSwappedReceived))

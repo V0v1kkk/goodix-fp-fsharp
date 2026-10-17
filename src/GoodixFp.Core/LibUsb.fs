@@ -11,6 +11,8 @@ type IUsbTransport =
     inherit IDisposable
     abstract member Write: data: byte[] -> Result<unit, DriverError>
     abstract member Read: length: int * timeoutMs: int -> Result<byte[], DriverError>
+    abstract member DrainBuffer: ?timeoutMs: int -> unit
+    abstract member ResetConnection: unit -> Result<unit, DriverError>
 
 // ============================================================================
 // Native LibUsb-1.0 P/Invoke Bindings
@@ -77,48 +79,55 @@ open LibUsbConstants
 // LibUsb Implementation for Goodix 53xd Devices
 // ============================================================================
 
-type LibUsbTransport private (ctx: nativeint, handle: nativeint, interfaceNumber: int) =
+type LibUsbTransport private (vid: UsbVid, pid: UsbPid, iface: int, initialCtx: nativeint, initialHandle: nativeint) =
+    let mutable ctx = initialCtx
+    let mutable handle = initialHandle
     let mutable isDisposed = false
 
-    static member Open(vid: UsbVid, pid: UsbPid, ?interfaceNumber: int) : Result<LibUsbTransport, DriverError> =
-        let iface = defaultArg interfaceNumber 0
-        let mutable ctx = 0n
-        let initRes = NativeLibUsb.libusb_init(&ctx)
+    static let tryOpenDevice (vid: UsbVid) (pid: UsbPid) (iface: int) =
+        let mutable newCtx = 0n
+        let initRes = NativeLibUsb.libusb_init(&newCtx)
         if initRes <> 0 then
             Error (UsbError ("Failed to initialize libusb", initRes))
         else
-            let devHandle = NativeLibUsb.libusb_open_device_with_vid_pid(ctx, vid.Value, pid.Value)
+            let devHandle = NativeLibUsb.libusb_open_device_with_vid_pid(newCtx, vid.Value, pid.Value)
             if devHandle = 0n then
-                NativeLibUsb.libusb_exit(ctx)
+                NativeLibUsb.libusb_exit(newCtx)
                 Error (DeviceNotReady $"Device with VID 0x{vid.Value:x4} PID 0x{pid.Value:x4} not found or permission denied")
             else
-                // Detach kernel driver if active
-                if NativeLibUsb.libusb_kernel_driver_active(devHandle, iface) = 1 then
-                    let detachRes = NativeLibUsb.libusb_detach_kernel_driver(devHandle, iface)
-                    if detachRes <> 0 then
-                        NativeLibUsb.libusb_close(devHandle)
-                        NativeLibUsb.libusb_exit(ctx)
-                        Error (UsbError ("Failed to detach kernel driver", detachRes))
-                    else
-                        let claimRes = NativeLibUsb.libusb_claim_interface(devHandle, iface)
-                        if claimRes <> 0 then
-                            NativeLibUsb.libusb_close(devHandle)
-                            NativeLibUsb.libusb_exit(ctx)
-                            Error (UsbError ("Failed to claim interface", claimRes))
-                        else
-                            NativeLibUsb.libusb_clear_halt(devHandle, EndpointOut) |> ignore
-                            NativeLibUsb.libusb_clear_halt(devHandle, EndpointIn) |> ignore
-                            Ok (new LibUsbTransport(ctx, devHandle, iface))
-                else
+                let detachAndClaim () =
+                    if NativeLibUsb.libusb_kernel_driver_active(devHandle, iface) = 1 then
+                        let detachRes = NativeLibUsb.libusb_detach_kernel_driver(devHandle, iface)
+                        if detachRes <> 0 then Error (UsbError ("Failed to detach kernel driver", detachRes))
+                        else Ok ()
+                    else Ok ()
+
+                match detachAndClaim () with
+                | Error err ->
+                    NativeLibUsb.libusb_close(devHandle)
+                    NativeLibUsb.libusb_exit(newCtx)
+                    Error err
+                | Ok () ->
                     let claimRes = NativeLibUsb.libusb_claim_interface(devHandle, iface)
                     if claimRes <> 0 then
                         NativeLibUsb.libusb_close(devHandle)
-                        NativeLibUsb.libusb_exit(ctx)
+                        NativeLibUsb.libusb_exit(newCtx)
                         Error (UsbError ("Failed to claim interface", claimRes))
                     else
                         NativeLibUsb.libusb_clear_halt(devHandle, EndpointOut) |> ignore
                         NativeLibUsb.libusb_clear_halt(devHandle, EndpointIn) |> ignore
-                        Ok (new LibUsbTransport(ctx, devHandle, iface))
+                        let drainBuf = Array.zeroCreate<byte> 1024
+                        let mutable transferred = 0
+                        while NativeLibUsb.libusb_bulk_transfer(devHandle, EndpointIn, drainBuf, drainBuf.Length, &transferred, 50u) = 0 && transferred > 0 do
+                            ()
+                        Ok (newCtx, devHandle)
+
+    static member Open(vid: UsbVid, pid: UsbPid, ?interfaceNumber: int) : Result<LibUsbTransport, DriverError> =
+        let iface = defaultArg interfaceNumber 0
+        match tryOpenDevice vid pid iface with
+        | Ok (c, h) -> Ok (new LibUsbTransport(vid, pid, iface, c, h))
+        | Error err -> Error err
+
 
     interface IUsbTransport with
         /// Writes data with 64-byte padding & chunking on Bulk OUT (0x01).
@@ -192,11 +201,49 @@ type LibUsbTransport private (ctx: nativeint, handle: nativeint, interfaceNumber
                     else
                         Ok received
 
+        member this.DrainBuffer(?timeoutMs: int) =
+            let timeout = defaultArg timeoutMs 50
+            if not isDisposed && handle <> 0n then
+                let drainBuf = Array.zeroCreate<byte> 1024
+                let mutable transferred = 0
+                while NativeLibUsb.libusb_bulk_transfer(handle, EndpointIn, drainBuf, drainBuf.Length, &transferred, uint32 timeout) = 0 && transferred > 0 do
+                    ()
+
+        member this.ResetConnection() : Result<unit, DriverError> =
+            if not isDisposed then
+                try
+                    if handle <> 0n then
+                        NativeLibUsb.libusb_release_interface(handle, iface) |> ignore
+                        NativeLibUsb.libusb_close(handle)
+                        handle <- 0n
+                    if ctx <> 0n then
+                        NativeLibUsb.libusb_exit(ctx)
+                        ctx <- 0n
+                with _ -> ()
+
+            let mutable result = Error (DeviceNotReady "Device did not re-enumerate after reset")
+            let mutable attempts = 0
+            while attempts < 20 && result.IsError do
+                System.Threading.Thread.Sleep(300)
+                attempts <- attempts + 1
+                match tryOpenDevice vid pid iface with
+                | Ok (newCtx, newHandle) ->
+                    ctx <- newCtx
+                    handle <- newHandle
+                    isDisposed <- false
+                    result <- Ok ()
+                | Error _ -> ()
+            result
+
         member this.Dispose() =
             if not isDisposed then
                 isDisposed <- true
                 try
-                    NativeLibUsb.libusb_release_interface(handle, interfaceNumber) |> ignore
-                    NativeLibUsb.libusb_close(handle)
-                    NativeLibUsb.libusb_exit(ctx)
+                    if handle <> 0n then
+                        NativeLibUsb.libusb_release_interface(handle, iface) |> ignore
+                        NativeLibUsb.libusb_close(handle)
+                        handle <- 0n
+                    if ctx <> 0n then
+                        NativeLibUsb.libusb_exit(ctx)
+                        ctx <- 0n
                 with _ -> ()

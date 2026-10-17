@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # Dell Canonical Goodix blob fetch & ELF patch script
 # Downloads libfprint-2-tod1-goodix_0.0.6-0ubuntu1~somerville1_amd64.deb, extracts
 # libfprint-tod-goodix-53xc-0.0.6.so, verifies SHA-256, applies the 3-step ELF binary patch,
@@ -11,10 +13,12 @@ EXPECTED_SO_SHA256="bfa30696fbed9b86cfb5339293d458b9175d05b8895a8644d6b72615ffc9
 SO_INTERNAL_PATH="usr/lib/x86_64-linux-gnu/libfprint-2/tod-1/libfprint-tod-goodix-53xc-0.0.6.so"
 
 TARGET_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/goodix-fp"
-TARGET_SO="${TARGET_DIR}/libgoodix_tod_53xc.so"
+OUT_DIR="${OUT_DIR:-${TARGET_DIR}}"
+TARGET_SO="${OUT_DIR}/libgoodix_tod_53xc.so"
+TARGET_BIN="${OUT_DIR}/GF5298_GM168SEC_APP_13016.bin"
 
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/goodix-fp"
-mkdir -p "${CACHE_DIR}" "${TARGET_DIR}"
+mkdir -p "${CACHE_DIR}" "${TARGET_DIR}" "${OUT_DIR}"
 
 DEB_FILE="${CACHE_DIR}/libfprint-2-tod1-goodix_0.0.6-0ubuntu1~somerville1_amd64.deb"
 
@@ -107,3 +111,104 @@ EOF
 
 chmod 0755 "${TARGET_SO}"
 echo "[+] Done. Standalone patched vendor blob ready at ${TARGET_SO}"
+
+echo "[+] Checking for Windows driver Wbdi.dll to extract Goodix 53xd firmware..."
+WBDI_FOUND=""
+for candidate in "${WBDI_DLL:-}" \
+                 "/home/vladimir/AI/Workspaces/DriverReverseEngeneering/windows-driver/Wbdi.dll" \
+                 "${SCRIPT_DIR}/../../windows-driver/Wbdi.dll" \
+                 "${CACHE_DIR}/Wbdi.dll"; do
+    if [[ -n "${candidate}" && -f "${candidate}" ]]; then
+        WBDI_FOUND="${candidate}"
+        break
+    fi
+done
+
+if [[ -z "${WBDI_FOUND}" ]]; then
+    echo "[-] Warning: Wbdi.dll not found; skipping GF5298_GM168SEC_APP_13016.bin extraction." >&2
+else
+    echo "[+] Extracting firmware from ${WBDI_FOUND} -> ${TARGET_BIN}..."
+    python3 - << 'EOF' "${WBDI_FOUND}" "${TARGET_BIN}"
+import sys
+import struct
+import hashlib
+
+wbdi_path = sys.argv[1]
+out_bin = sys.argv[2]
+
+# Precomputed MPEG-2 / POSIX MSB-first CRC table (0x04C11DB7)
+poly = 0x04C11DB7
+table = []
+for i in range(256):
+    r = i << 24
+    for _ in range(8):
+        if r & 0x80000000:
+            r = ((r << 1) ^ poly) & 0xffffffff
+        else:
+            r = (r << 1) & 0xffffffff
+    table.append(r)
+
+def goodix_crc32(data: bytes) -> int:
+    crc = 0xffffffff
+    for b in data:
+        idx = ((crc >> 24) ^ b) & 0xff
+        crc = ((crc << 8) ^ table[idx]) & 0xffffffff
+    return crc
+
+with open(wbdi_path, "rb") as f:
+    dll = f.read()
+
+start = 0xdcfe0
+length = 24286
+res = dll[start : start + length]
+if len(res) != length:
+    raise ValueError(f"Extracted slice length {len(res)} != {length}")
+
+magic = res[0:26]
+if magic != b"\x19GF5298_GM168SEC_APP_13016":
+    raise ValueError(f"Magic header mismatch: {magic}")
+print("  Magic header verified: \\x19GF5298_GM168SEC_APP_13016")
+
+stored_res_crc = struct.unpack("<I", res[24282:24286])[0]
+if stored_res_crc != 0x5eed9d14:
+    raise ValueError(f"Stored resource CRC 0x{stored_res_crc:08x} != 0x5eed9d14")
+calc_res_crc = goodix_crc32(res[:24282])
+if calc_res_crc != 0x5eed9d14:
+    raise ValueError(f"Calculated resource CRC 0x{calc_res_crc:08x} != 0x5eed9d14")
+print("  Resource CRC32 verified: 0x5eed9d14")
+
+arm_payload = res[26:24282]
+if len(arm_payload) != 24256:
+    raise ValueError(f"ARM payload length {len(arm_payload)} != 24256")
+arm_crc = goodix_crc32(arm_payload)
+if arm_crc != 0x2448101a:
+    raise ValueError(f"ARM payload CRC 0x{arm_crc:08x} != 0x2448101a")
+print("  ARM payload length 24,256 and CRC32 0x2448101a verified")
+
+hdr_tail = struct.pack("<II", 24256, 0x2448101a)
+hdr_crc = goodix_crc32(hdr_tail)
+if hdr_crc != 0xe752e818:
+    raise ValueError(f"Header CRC 0x{hdr_crc:08x} != 0xe752e818")
+hdr = struct.pack("<I", hdr_crc) + hdr_tail
+fw = hdr + arm_payload
+if len(fw) != 24268:
+    raise ValueError(f"Final firmware length {len(fw)} != 24268")
+
+sha256 = hashlib.sha256(fw).hexdigest()
+expected_sha256 = "0f28f8f52860afea86bd56d869cd7f4fe41ba943edd1d56100113e94ecfd6c0d"
+if sha256 != expected_sha256:
+    raise ValueError(f"SHA-256 mismatch: got {sha256}, expected {expected_sha256}")
+print(f"  Firmware SHA-256 verified: {sha256}")
+
+with open(out_bin, "wb") as f:
+    f.write(fw)
+
+print(f"[+] Firmware successfully written to: {out_bin}")
+EOF
+    chmod 0644 "${TARGET_BIN}"
+    if [[ "${TARGET_DIR}" != "${OUT_DIR}" ]]; then
+        cp -f "${TARGET_BIN}" "${TARGET_DIR}/GF5298_GM168SEC_APP_13016.bin"
+    fi
+    echo "[+] Done. Firmware binary ready at ${TARGET_BIN}"
+fi
+

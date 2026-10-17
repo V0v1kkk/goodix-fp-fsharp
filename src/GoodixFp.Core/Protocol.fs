@@ -1,6 +1,7 @@
 namespace GoodixFp.Core
 
 open System
+open System.Security.Cryptography
 
 module Protocol =
 
@@ -100,7 +101,13 @@ module Protocol =
     let CommandPovImageCheck = 0xd6uy
 
     [<Literal>]
+    let CommandPresetPskWrite = 0xe0uy
+
+    [<Literal>]
     let CommandPresetPskWriteR = 0xe0uy
+
+    [<Literal>]
+    let CommandPresetPskRead = 0xe4uy
 
     [<Literal>]
     let CommandPresetPskReadR = 0xe4uy
@@ -386,35 +393,90 @@ module Protocol =
     let PreFlagsPresetPskWrite: byte[] =
         Convert.FromHexString("56a5bb956b7c8d9e0000")
 
-    let packPresetPskWrite (flags: uint32) (payload: byte[]) (length: int option) (offset: int option) (preFlags: byte[] option) : byte[] =
-        let pre = defaultArg preFlags [||]
+    let packPresetPskWrite (flags: uint32) (payload: byte[]) (length: int) (offset: int) (preFlags: byte[]) : byte[] =
         let flagsBytes = BitConverter.GetBytes(flags)
         let payloadLenBytes = BitConverter.GetBytes(uint32 payload.Length)
-        let rawData = Array.concat [ pre; flagsBytes; payloadLenBytes; payload ]
+        let rawData = Array.concat [ preFlags; flagsBytes; payloadLenBytes; payload ]
 
-        let finalData =
-            match length, offset with
-            | Some len, Some off ->
-                let totalLenBytes = BitConverter.GetBytes(uint32 rawData.Length)
-                let lenBytes = BitConverter.GetBytes(uint32 len)
-                let offBytes = BitConverter.GetBytes(uint32 off)
-                let slice = Array.sub rawData off len
-                Array.concat [ totalLenBytes; lenBytes; offBytes; slice ]
-            | _ -> rawData
+        let totalLenBytes = BitConverter.GetBytes(uint32 rawData.Length)
+        let lenBytes = BitConverter.GetBytes(uint32 length)
+        let offBytes = BitConverter.GetBytes(uint32 offset)
+        let slice =
+            if offset + length <= rawData.Length then Array.sub rawData offset length
+            else rawData
+        let finalData = Array.concat [ totalLenBytes; lenBytes; offBytes; slice ]
 
-        let inner = encodeMessageProtocol CommandPresetPskWriteR finalData true
+        let inner = encodeMessageProtocol CommandPresetPskWrite finalData true
         encodeMessagePack FlagsMessageProtocol inner
 
-    let packPresetPskRead (flags: uint32) (length: int option) (offset: int option) : byte[] =
+    let packPresetPskWriteOpt (flags: uint32) (payload: byte[]) (length: int option) (offset: int option) (preFlags: byte[] option) : byte[] =
+        let pre = defaultArg preFlags [||]
+        let len = defaultArg length (pre.Length + 8 + payload.Length)
+        let off = defaultArg offset 0
+        packPresetPskWrite flags payload len off pre
+
+    let packPresetPskRead (flags: uint32) (length: int) (offset: int) : byte[] =
         let flagsBytes = BitConverter.GetBytes(flags)
         let zeroBytes = BitConverter.GetBytes(0u)
-        let prefix =
-            match length, offset with
-            | Some len, Some off ->
-                let lenBytes = BitConverter.GetBytes(uint32 len)
-                let offBytes = BitConverter.GetBytes(uint32 off)
-                Array.concat [ lenBytes; offBytes ]
-            | _ -> [||]
-        let finalData = Array.concat [ prefix; flagsBytes; zeroBytes ]
-        let inner = encodeMessageProtocol CommandPresetPskReadR finalData true
+        let effectiveLen = if length <= 0 && flags = 0xbb020001u then 32 else length
+        let lenBytes = BitConverter.GetBytes(uint32 effectiveLen)
+        let offBytes = BitConverter.GetBytes(uint32 offset)
+        let finalData = Array.concat [ lenBytes; offBytes; flagsBytes; zeroBytes ]
+        let inner = encodeMessageProtocol CommandPresetPskRead finalData true
         encodeMessagePack FlagsMessageProtocol inner
+
+    let packPresetPskReadOpt (flags: uint32) (length: int option) (offset: int option) : byte[] =
+        let len = defaultArg length 0
+        let off = defaultArg offset 0
+        packPresetPskRead flags len off
+
+    let packMcuEraseApp (sleepTime: byte) : byte[] =
+        let payload = [| 0x00uy; sleepTime |]
+        let inner = encodeMessageProtocol CommandMcuEraseApp payload true
+        encodeMessagePack FlagsMessageProtocol inner
+
+    let packWriteFirmware (offset: uint32) (payload: byte[]) (number: uint32) : byte[] =
+        let offsetBytes = BitConverter.GetBytes(offset)
+        let lenBytes = BitConverter.GetBytes(uint32 payload.Length)
+        let numBytes = BitConverter.GetBytes(number)
+        let fullPayload = Array.concat [ offsetBytes; lenBytes; numBytes; payload ]
+        let inner = encodeMessageProtocol CommandWriteFirmware fullPayload true
+        encodeMessagePack FlagsMessageProtocol inner
+
+    let packCheckFirmware (hmac: byte[]) : byte[] =
+        let inner = encodeMessageProtocol CommandCheckFirmware hmac true
+        encodeMessagePack FlagsMessageProtocol inner
+
+    /// Pure function validating 24,268-byte firmware image integrity via Goodix CRC32
+    let verifyFirmwareImage (fw: byte[]) : Result<unit, DriverError> =
+        if isNull fw || fw.Length <> 24268 then
+            Error (ValidationError ("FirmwareImage", $"Expected firmware image length 24268, got {if isNull fw then 0 else fw.Length}"))
+        else
+            let expectedHeaderCrc = BitConverter.ToUInt32(fw, 0)
+            let actualHeaderCrc = Crc32.goodixCrc32 fw.[4..11]
+            if actualHeaderCrc <> expectedHeaderCrc then
+                Error (ChecksumMismatch (expectedHeaderCrc, actualHeaderCrc))
+            else
+                let payloadLen = BitConverter.ToUInt32(fw, 4)
+                if payloadLen <> 24256u then
+                    Error (ValidationError ("FirmwarePayloadLength", $"Expected 24256 bytes in header, got {payloadLen}"))
+                else
+                    let expectedCodeCrc = BitConverter.ToUInt32(fw, 8)
+                    let actualCodeCrc = Crc32.goodixCrc32 fw.[12..]
+                    if actualCodeCrc <> expectedCodeCrc then
+                        Error (ChecksumMismatch (expectedCodeCrc, actualCodeCrc))
+                    else
+                        Ok ()
+
+    /// Computes the 32-byte firmware check HMAC for Goodix 53xd IAP mode
+    let computeFirmwareHmac (psk: byte[]) (firmware: byte[]) : byte[] =
+        let pskLenBytes = [| byte ((psk.Length >>> 8) &&& 0xff); byte (psk.Length &&& 0xff) |]
+        let rawPmk = Array.concat [ pskLenBytes; psk; pskLenBytes; psk ]
+        use sha256 = SHA256.Create()
+        let pmk = sha256.ComputeHash(rawPmk)
+        let modBytes = Array.init 64 (fun i -> byte (i + 1))
+        use hmacPmk = new HMACSHA256(pmk)
+        let pmkHmac = hmacPmk.ComputeHash(modBytes)
+        use hmacFw = new HMACSHA256(pmkHmac)
+        hmacFw.ComputeHash(firmware)
+

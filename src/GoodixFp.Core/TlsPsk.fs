@@ -247,7 +247,7 @@ type PureFSharpTlsPskTunnel(psk: byte[]) =
                                 let contentAndMacLen = decrypted.Length - 1 - padLen
                                 let contentLen = contentAndMacLen - 32
                                 if contentLen < 0 then
-                                    failwith "Invalid Finished record padding"
+                                    failwith $"Invalid Finished record padding: padLen={padLen}, decryptedLen={decrypted.Length}"
                                 let content = Array.sub decrypted 0 contentLen
                                 let mac = Array.sub decrypted contentLen 32
 

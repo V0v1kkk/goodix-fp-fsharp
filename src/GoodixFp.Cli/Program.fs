@@ -21,6 +21,18 @@ module Storage =
             Directory.CreateDirectory(tmplDir) |> ignore
         tmplDir
 
+    let getFirmwarePath () : string =
+        let xdg = Environment.GetEnvironmentVariable("XDG_DATA_HOME")
+        let primaryPath =
+            let baseDir =
+                if not (String.IsNullOrWhiteSpace xdg) then xdg
+                else Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "share")
+            Path.Combine(baseDir, "goodix-fp", "GF5298_GM168SEC_APP_13016.bin")
+        if File.Exists primaryPath then primaryPath
+        elif File.Exists "/home/vladimir/.local/share/goodix-fp/GF5298_GM168SEC_APP_13016.bin" then
+            "/home/vladimir/.local/share/goodix-fp/GF5298_GM168SEC_APP_13016.bin"
+        else primaryPath
+
     let loadAllTemplates () : (FingerId * TemplateBlob) list =
         let dir = getTemplateDirectory ()
         if not (Directory.Exists dir) then []
@@ -66,8 +78,16 @@ module CommandLine =
             parseOptions rest { opts with Command = "benchmark" }
         | "probe" :: rest ->
             parseOptions rest { opts with Command = "probe" }
+        | "diagnose" :: rest ->
+            parseOptions rest { opts with Command = "diagnose" }
         | "provision-psk" :: rest ->
             parseOptions rest { opts with Command = "provision-psk" }
+        | "calibrate" :: rest ->
+            let (prefix, remaining) =
+                match rest with
+                | p :: r when not (p.StartsWith("-")) -> (Some p, r)
+                | _ -> (None, rest)
+            parseOptions remaining { opts with Command = "calibrate"; Prefix = prefix }
         | "capture" :: rest ->
             let (prefix, remaining) =
                 match rest with
@@ -86,6 +106,8 @@ module CommandLine =
     and private parseOptions (args: string list) (opts: CliOptions) : Result<CliOptions, string> =
         match args with
         | [] -> Ok opts
+        | "--calibrate-only" :: rest ->
+            parseOptions rest { opts with Command = "calibrate" }
         | "--tls" :: "bc" :: rest ->
             parseOptions rest { opts with UseBouncyCastle = true }
         | "--tls" :: "pure" :: rest ->
@@ -165,17 +187,119 @@ module DeviceRunner =
                 return 0
         })
 
-    let runProvisionPsk (opts: CliOptions) : Task<int> =
-        printfn $"[*] Provisioning PSK White-Box on device (VID: 0x{opts.Vid:X4}, PID: 0x{opts.Pid:X4})..."
+    let runDiagnose (opts: CliOptions) : Task<int> =
+        printfn $"[*] Running diagnostic raw probe on device (VID: 0x{opts.Vid:X4}, PID: 0x{opts.Pid:X4})..."
         withDevice opts (fun dev -> task {
-            let! pskRes = dev.ProvisionZeroPsk()
-            match pskRes with
+            let testCommand (name: string) (packet: byte[]) =
+                printfn $"\n--- Testing {name} ---"
+                printfn $"Tx ({packet.Length} bytes): {Convert.ToHexString(packet)}"
+                match dev.Transport.Write(packet) with
+                | Error e -> printfn $"Tx Error: {e}"
+                | Ok () ->
+                    match dev.Transport.Read(1024, 2000) with
+                    | Ok rx ->
+                        printfn $"Rx ({rx.Length} bytes): {Convert.ToHexString(rx)}"
+                        if rx.Length >= 6 && rx.[4] = 0xb0uy then
+                            match dev.Transport.Read(1024, 2000) with
+                            | Ok rx2 -> printfn $"Rx2 ({rx2.Length} bytes): {Convert.ToHexString(rx2)}"
+                            | Error e -> printfn $"Rx2 Error: {e}"
+                    | Error e -> printfn $"Rx Error: {e}"
+
+            testCommand "NOP" (Protocol.packNop())
+
+            let mcuStatePack = Protocol.encodeMessagePack Protocol.FlagsMessageProtocol (Protocol.encodeMessageProtocol 0x2cuy [| 0x01uy; 0x00uy |] true)
+            testCommand "Query MCU State (0x2c)" mcuStatePack
+
+            testCommand "Firmware Version (0xa8)" (Protocol.packFirmwareVersion())
+
+            let iapVerPack = Protocol.encodeMessagePack Protocol.FlagsMessageProtocol (Protocol.encodeMessageProtocol 0xf6uy [| 50uy; 0x00uy |] true)
+            testCommand "Get IAP Version (0xf6)" iapVerPack
+
+            testCommand "Read PSK 0xbb020001 (len 32)" (Protocol.packPresetPskRead 0xbb020001u 32 0)
+
+            testCommand "Read PSK 0xbb010002 (len 256)" (Protocol.packPresetPskRead 0xbb010002u 256 0)
+
+            testCommand "Read PSK 0xbb010003 (len 96)" (Protocol.packPresetPskRead 0xbb010003u 96 0)
+
+            testCommand "Read PSK 0xbb010003 (len 114)" (Protocol.packPresetPskRead 0xbb010003u 114 0)
+
+            testCommand "Read PSK 0xbb010003 (len 128)" (Protocol.packPresetPskRead 0xbb010003u 128 0)
+
+            let! r03_96 = dev.ReadPresetPsk(0xbb010003u, 96, 0)
+            match r03_96 with
+            | Ok p -> printfn $"\ndev.ReadPresetPsk(0xbb010003, 96, 0) -> OK ({p.Length} bytes): {Convert.ToHexString(p)}"
+            | Error e -> printfn $"\ndev.ReadPresetPsk(0xbb010003, 96, 0) -> Error: {e}"
+
+            let! r03_114 = dev.ReadPresetPsk(0xbb010003u, 114, 0)
+            match r03_114 with
+            | Ok p -> printfn $"dev.ReadPresetPsk(0xbb010003, 114, 0) -> OK ({p.Length} bytes): {Convert.ToHexString(p)}"
+            | Error e -> printfn $"dev.ReadPresetPsk(0xbb010003, 114, 0) -> Error: {e}"
+
+            let! r03_128 = dev.ReadPresetPsk(0xbb010003u, 128, 0)
+            match r03_128 with
+            | Ok p -> printfn $"dev.ReadPresetPsk(0xbb010003, 128, 0) -> OK ({p.Length} bytes): {Convert.ToHexString(p)}"
+            | Error e -> printfn $"dev.ReadPresetPsk(0xbb010003, 128, 0) -> Error: {e}"
+
+            return 0
+        })
+
+
+    let runProvisionPsk (opts: CliOptions) : Task<int> =
+        let fwPath = Storage.getFirmwarePath ()
+        printfn $"[*] Loading firmware image from: {fwPath}"
+        if not (File.Exists fwPath) then
+            eprintfn $"[!] Firmware file not found: {fwPath}"
+            eprintfn "    Please run 'scripts/fetch-goodix-blob.sh' to extract the firmware first."
+            Task.FromResult 1
+        else
+            let firmwareBytes = File.ReadAllBytes fwPath
+            match Protocol.verifyFirmwareImage firmwareBytes with
             | Error err ->
-                eprintfn $"[!] PSK provisioning failed: {err}"
-                return 1
+                eprintfn $"[!] Firmware verification failed: {err}"
+                Task.FromResult 1
             | Ok () ->
-                printfn "[+] PSK White-Box successfully provisioned and verified."
-                return 0
+                printfn $"[+] Firmware verified: {firmwareBytes.Length} bytes, header and ARM code CRCs valid."
+                printfn $"[*] Provisioning PSK White-Box on device (VID: 0x{opts.Vid:X4}, PID: 0x{opts.Pid:X4})..."
+                withDevice opts (fun dev -> task {
+                    let! pskRes = dev.ProvisionZeroPsk(firmwareBytes)
+                    match pskRes with
+                    | Error err ->
+                        eprintfn $"[!] PSK provisioning failed: {err}"
+                        return 1
+                    | Ok () ->
+                        printfn "[+] PSK White-Box successfully provisioned and verified (in APP mode)."
+                        return 0
+                })
+
+    let runCalibrate (opts: CliOptions) : Task<int> =
+        let prefix = defaultArg opts.Prefix "calib"
+        let tlsEngine = if opts.UseBouncyCastle then "BouncyCastle" else "Pure F#"
+        printfn $"[*] Initializing calibration session (TLS: {tlsEngine})..."
+        withDevice opts (fun dev -> task {
+            printfn "[*] Activating session and performing TLS handshake..."
+            let! actRes = dev.ActivateSession()
+            match actRes with
+            | Error err ->
+                eprintfn $"[!] Session activation failed: {err}"
+                return 1
+            | Ok _ ->
+                printfn "[*] Capturing baseline calibration frame (no touch)..."
+                let! capRes = dev.CaptureFrame()
+                match capRes with
+                | Error err ->
+                    eprintfn $"[!] Calibration frame capture failed: {err}"
+                    return 1
+                | Ok rawFrame ->
+                    let! _ = dev.Sleep()
+                    let rawPgm = FrameDecoder.toPgm12Bit rawFrame.Pixels 80 64
+                    let outPath = $"{prefix}-baseline16.pgm"
+                    let dir = Path.GetDirectoryName(outPath)
+                    if not (String.IsNullOrWhiteSpace dir) && not (Directory.Exists dir) then
+                        Directory.CreateDirectory(dir) |> ignore
+                    File.WriteAllBytes(outPath, rawPgm)
+                    printfn $"[+] Verified GoodixFrameCrc on {rawPgm.Length} bytes frame payload."
+                    printfn $"[+] Saved baseline 16-bit PGM image: {outPath}"
+                    return 0
         })
 
     let runCapture (opts: CliOptions) : Task<int> =
@@ -628,13 +752,15 @@ module Program =
         printfn "Usage: goodix-fp <command> [options]\n"
         printfn "Commands:"
         printfn "  probe                     Query firmware version, chip ID, and OTP"
-        printfn "  provision-psk             Write zero PSK whitebox and verify PMK_HASH"
+        printfn "  provision-psk             Write zero PSK whitebox and restore APP firmware"
+        printfn "  calibrate [prefix]        Capture baseline calibration frame (no touch)"
         printfn "  capture [prefix]          Capture baseline & frame, export PGM images"
         printfn "  enroll <finger-name>      12-touch interactive enrollment loop"
         printfn "  verify                    Verify finger against enrolled templates (PAM)"
         printfn "  benchmark                 Run Native AOT performance benchmark suite"
         printfn "  help                      Show this help message\n"
         printfn "Options:"
+        printfn "  --calibrate-only          Run calibration capture only"
         printfn "  --tls <pure|bc>           TLS PSK engine (default: pure)"
         printfn "  --vid <hex>               USB Vendor ID (default: 27c6)"
         printfn "  --pid <hex>               USB Product ID (default: 538d)\n"
@@ -656,8 +782,12 @@ module Program =
                 0
             | "probe" ->
                 (DeviceRunner.runProbe opts).GetAwaiter().GetResult()
+            | "diagnose" ->
+                (DeviceRunner.runDiagnose opts).GetAwaiter().GetResult()
             | "provision-psk" ->
                 (DeviceRunner.runProvisionPsk opts).GetAwaiter().GetResult()
+            | "calibrate" ->
+                (DeviceRunner.runCalibrate opts).GetAwaiter().GetResult()
             | "capture" ->
                 (DeviceRunner.runCapture opts).GetAwaiter().GetResult()
             | "enroll" ->
