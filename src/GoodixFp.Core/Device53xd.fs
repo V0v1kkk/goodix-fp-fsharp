@@ -14,6 +14,28 @@ type DeviceInfo = {
     Otp: SensorOtp
 }
 
+module FdtCalculations =
+    /// Computes FDT down base from 16 bytes (8 uint16 little-endian words) of MCU baseline readings.
+    /// Matches MilanFSerCalcFdtDownBase from libfprint-tod-goodix-53xc:
+    /// For each word w, down_word = ((w >>> 1) <<< 8) ||| 0x80us
+    /// In little-endian bytes: byte[2*i] = 0x80uy, byte[2*i + 1] = byte ((w >>> 1) &&& 0xff).
+    let calcFdtDownBase (fdtData: byte[]) : byte[] =
+        if isNull fdtData || fdtData.Length < 16 then
+            [|
+                0x91uy; 0x91uy; 0x8buy; 0x8buy
+                0x96uy; 0x96uy; 0x91uy; 0x91uy
+                0x98uy; 0x98uy; 0x90uy; 0x90uy
+                0x92uy; 0x92uy; 0x88uy; 0x88uy
+            |]
+        else
+            let downBase = Array.zeroCreate<byte> 16
+            for i in 0 .. 7 do
+                let w = uint16 fdtData.[2 * i] ||| (uint16 fdtData.[2 * i + 1] <<< 8)
+                let wShift = (int w) >>> 1
+                downBase.[2 * i] <- 0x80uy
+                downBase.[2 * i + 1] <- byte (wShift &&& 0xff)
+            downBase
+
 // ============================================================================
 // High-Level Goodix 53xd Driver
 // ============================================================================
@@ -23,6 +45,7 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
     let mutable currentOtp: SensorOtp option = None
     let mutable baselineFrame: RawFrame12Bit option = None
     let mutable lastFdtUpBase: byte[] option = None
+    let mutable currentFdtDownBase: byte[] option = None
 
     new(transport: IUsbTransport) =
         new Goodix53xdDevice(transport, new PureFSharpTlsPskTunnel())
@@ -32,6 +55,7 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
     member this.CurrentOtp = currentOtp
     member this.BaselineFrame = baselineFrame
     member this.LastFdtUpBase = lastFdtUpBase
+    member this.CurrentFdtDownBase = currentFdtDownBase
 
     // ------------------------------------------------------------------------
     // Low-Level Packet Exchange Helpers
@@ -411,7 +435,10 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
         // 8.2: mcu_switch_to_fdt_mode(0x0d... 1, true)
         let fdt0dWait = makeFdtModePacket 0x0duy true
         do! this.SendAndExpectAck(Protocol.packSwitchToFdtMode fdt0dWait, Protocol.CommandMcuSwitchToFdtMode)
-        let! _ = this.ReadCommandResponse(Protocol.CommandMcuSwitchToFdtMode, 2000)
+        let! fdtResp0 = this.ReadCommandResponse(Protocol.CommandMcuSwitchToFdtMode, 2000)
+        if fdtResp0.Length >= 20 && currentFdtDownBase.IsNone then
+            let rawFdt = Array.sub fdtResp0 4 16
+            currentFdtDownBase <- Some (FdtCalculations.calcFdtDownBase rawFdt)
 
         // 8.3: write_sensor_register 0x022c = [0x0a, 0x03]
         do! this.SendAndExpectAck(Protocol.packWriteSensorRegister 0x022cus [| 0x0auy; 0x03uy |], Protocol.CommandWriteSensorRegister)
@@ -468,7 +495,10 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
 
         // 8.18: mcu_switch_to_fdt_mode(0x0d... 1, true)
         do! this.SendAndExpectAck(Protocol.packSwitchToFdtMode fdt0dWait, Protocol.CommandMcuSwitchToFdtMode)
-        let! _ = this.ReadCommandResponse(Protocol.CommandMcuSwitchToFdtMode, 2000)
+        let! fdtResp = this.ReadCommandResponse(Protocol.CommandMcuSwitchToFdtMode, 2000)
+        if fdtResp.Length >= 20 then
+            let rawFdt = Array.sub fdtResp 4 16
+            currentFdtDownBase <- Some (FdtCalculations.calcFdtDownBase rawFdt)
 
         // 8.19: mcu_switch_to_sleep_mode
         do! this.SendAndExpectAck(Protocol.packSwitchToSleepMode(), Protocol.CommandMcuSwitchToSleepMode)
@@ -518,12 +548,16 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
             otp.FdtDac.[2]; 0x01uy
             otp.FdtDac.[3]; 0x01uy
         |]
-        let downThresholds = [|
-            0x91uy; 0x91uy; 0x8buy; 0x8buy
-            0x96uy; 0x96uy; 0x91uy; 0x91uy
-            0x98uy; 0x98uy; 0x90uy; 0x90uy
-            0x92uy; 0x92uy; 0x88uy; 0x88uy
-        |]
+        let downThresholds =
+            match currentFdtDownBase with
+            | Some b when b.Length = 16 -> b
+            | _ ->
+                [|
+                    0x91uy; 0x91uy; 0x8buy; 0x8buy
+                    0x96uy; 0x96uy; 0x91uy; 0x91uy
+                    0x98uy; 0x98uy; 0x90uy; 0x90uy
+                    0x92uy; 0x92uy; 0x88uy; 0x88uy
+                |]
 
         // 1. Send 0x32 with reply = false
         let fdtDownNoReply = Array.concat [| [| 0x8cuy; 0x01uy |]; dacBytes; downThresholds; [| 0x00uy |] |]
@@ -537,12 +571,7 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
         // 3. Extract FDT baseline up data if present in payload (offset 4..19: 16 bytes = 8 words)
         if downPayload.Length >= 20 then
             let fdtData = Array.sub downPayload 4 16
-            let upBase = Array.zeroCreate<byte> 16
-            for i in 0 .. 7 do
-                let w = uint16 fdtData.[2 * i] ||| (uint16 fdtData.[2 * i + 1] <<< 8)
-                let wShift = (int w) >>> 1
-                upBase.[2 * i] <- 0x80uy
-                upBase.[2 * i + 1] <- byte (wShift &&& 0xff)
+            let upBase = FdtCalculations.calcFdtDownBase fdtData
             lastFdtUpBase <- Some upBase
 
         // 4. Immediately perform post-touch 0x36 mode switch (matching driver_53xd.py lines 242-252)

@@ -547,8 +547,8 @@ let private generateSyntheticRidgeFrame (shiftX: float) (shiftY: float) (noise: 
             let dy = float y - cy
             let r = Math.Sqrt(dx * dx + dy * dy)
             let theta = Math.Atan2(dy, dx)
-            let ridge = Math.Sin(r * 0.8 - theta * 3.0)
-            let rawVal = 2048.0 + 800.0 * ridge + noise * (float ((x * 17 + y * 31) % 50) - 25.0)
+            let ridge = Math.Cos(r * 0.8 + 2.0 * theta)
+            let rawVal = 1500.0 + 350.0 * ridge + noise * (float ((x * 17 + y * 31) % 10) - 5.0)
             let clamped = Math.Clamp(rawVal, 0.0, 4095.0)
             pixels.[y * width + x] <- uint16 clamped
     pixels
@@ -1011,5 +1011,45 @@ let ``Goodix53xdDevice ProvisionZeroPsk executes full IAP -> PSK write -> Firmwa
             Assert.Contains(Protocol.CommandReset, commands)
         | Error err -> Assert.Fail($"ProvisionZeroPsk full sequence failed: {err}")
     }
+
+[<Fact>]
+let ``FdtCalculations calcFdtDownBase transforms 16-byte raw baseline correctly`` () =
+    // Create 16 bytes representing 8 words: 0x0122, 0x0124, 0x0116, 0x0116, 0x012c, 0x012c, 0x0122, 0x0122
+    let rawFdt = [|
+        0x22uy; 0x01uy // 0x0122 -> w>>>1 = 0x91 -> [0x80; 0x91]
+        0x24uy; 0x01uy // 0x0124 -> w>>>1 = 0x92 -> [0x80; 0x92]
+        0x16uy; 0x01uy // 0x0116 -> w>>>1 = 0x8b -> [0x80; 0x8b]
+        0x16uy; 0x01uy // 0x0116 -> w>>>1 = 0x8b -> [0x80; 0x8b]
+        0x2cuy; 0x01uy // 0x012c -> w>>>1 = 0x96 -> [0x80; 0x96]
+        0x2cuy; 0x01uy // 0x012c -> w>>>1 = 0x96 -> [0x80; 0x96]
+        0x22uy; 0x01uy // 0x0122 -> w>>>1 = 0x91 -> [0x80; 0x91]
+        0x22uy; 0x01uy // 0x0122 -> w>>>1 = 0x91 -> [0x80; 0x91]
+    |]
+    let downBase = FdtCalculations.calcFdtDownBase rawFdt
+    Assert.Equal(16, downBase.Length)
+    Assert.Equal<byte seq>(
+        [|
+            0x80uy; 0x91uy
+            0x80uy; 0x92uy
+            0x80uy; 0x8buy
+            0x80uy; 0x8buy
+            0x80uy; 0x96uy
+            0x80uy; 0x96uy
+            0x80uy; 0x91uy
+            0x80uy; 0x91uy
+        |],
+        downBase
+    )
+
+[<Fact>]
+let ``FdtCalculations calcFdtDownBase returns fallback for null or short input`` () =
+    let fallback = FdtCalculations.calcFdtDownBase null
+    Assert.Equal(16, fallback.Length)
+    Assert.Equal(0x91uy, fallback.[0])
+    Assert.Equal(0x91uy, fallback.[1])
+
+    let fallbackShort = FdtCalculations.calcFdtDownBase [| 0x01uy; 0x02uy |]
+    Assert.Equal(16, fallbackShort.Length)
+
 
 

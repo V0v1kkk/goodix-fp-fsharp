@@ -133,6 +133,23 @@ module FrameDecoder =
             outIdx <- outIdx + 2
         result
 
+    /// Imports 12-bit raw frame from binary PGM (P5) with maxval 4095 (big-endian).
+    let fromPgm12Bit (bytes: byte[]) : uint16[] =
+        if isNull bytes || bytes.Length < 15 then Array.empty
+        else
+            let mutable nlCount = 0
+            let mutable idx = 0
+            while idx < bytes.Length && nlCount < 3 do
+                if bytes.[idx] = 0x0auy then nlCount <- nlCount + 1
+                idx <- idx + 1
+            let pixelCount = (bytes.Length - idx) / 2
+            let pixels = Array.zeroCreate<uint16> pixelCount
+            for i in 0 .. pixelCount - 1 do
+                let hi = uint16 bytes.[idx + 2 * i]
+                let lo = uint16 bytes.[idx + 2 * i + 1]
+                pixels.[i] <- (hi <<< 8) ||| lo
+            pixels
+
     /// Exports 8-bit grayscale frame as binary PGM (P5) with maxval 255.
     let toPgm8Bit (pixels: byte[]) (width: int) (height: int) : byte[] =
         let header = Encoding.ASCII.GetBytes($"P5\n{width} {height}\n255\n")

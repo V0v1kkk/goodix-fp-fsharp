@@ -84,7 +84,7 @@ type GoodixTodMatcher(nativeFunctions: NativeFunctions, baselineFrame: RawFrame1
     // Packet Formatting (0x1af28 bytes expected by AlgFormatImageInterface)
     // ------------------------------------------------------------------------
 
-    static member FormatImagePacket(rawPixels: uint16[], enhancedPixels: byte[], quality: byte, coverage: byte, ?bData: byte[]) : byte[] =
+    static member FormatImagePacket(rawPixels: uint16[], enhancedPixels: byte[], quality: byte, coverage: byte, ?bData: byte[], ?outStruct: byte[]) : byte[] =
         let pkt = Array.zeroCreate<byte> 0x1af28
         pkt.[0] <- 0x4auy
         BitConverter.GetBytes(80us).CopyTo(pkt, 2)
@@ -102,6 +102,10 @@ type GoodixTodMatcher(nativeFunctions: NativeFunctions, baselineFrame: RawFrame1
         match bData with
         | Some b when b.Length = PreprocessedFrame.BDataSize ->
             Buffer.BlockCopy(b, 0, pkt, 0x16210, PreprocessedFrame.BDataSize)
+        | _ -> ()
+        match outStruct with
+        | Some o when o.Length >= PreprocessedFrame.OutStructSize ->
+            Buffer.BlockCopy(o, 0, pkt, 0x1aea4, PreprocessedFrame.OutStructSize)
         | _ -> ()
         pkt
 
@@ -143,86 +147,75 @@ type GoodixTodMatcher(nativeFunctions: NativeFunctions, baselineFrame: RawFrame1
                         Array.init raw.Pixels.Length (fun i -> uint16 (max 0 (int raw.Pixels.[i] - int b.Pixels.[i])))
                     | _ -> raw.Pixels
                 let bData = Array.zeroCreate<byte> PreprocessedFrame.BDataSize
+                let enhBuf = Array.zeroCreate<byte> PreprocessedFrame.PixelCount
                 let inStruct = Array.zeroCreate<byte> 0x40
                 let outStruct = Array.zeroCreate<byte> 0x40
                 let qualCov = Array.zeroCreate<int32> 2
                 let temp1 = Array.zeroCreate<byte> 65536
-                let temp2 = Array.zeroCreate<byte> 65536
 
                 let rawHandle = GCHandle.Alloc(rawPixels, GCHandleType.Pinned)
                 let bDataHandle = GCHandle.Alloc(bData, GCHandleType.Pinned)
+                let enhHandle = GCHandle.Alloc(enhBuf, GCHandleType.Pinned)
                 let inHandle = GCHandle.Alloc(inStruct, GCHandleType.Pinned)
                 let outHandle = GCHandle.Alloc(outStruct, GCHandleType.Pinned)
                 let qcHandle = GCHandle.Alloc(qualCov, GCHandleType.Pinned)
                 let t1Handle = GCHandle.Alloc(temp1, GCHandleType.Pinned)
-                let t2Handle = GCHandle.Alloc(temp2, GCHandleType.Pinned)
 
                 try
                     let rawPtr = rawHandle.AddrOfPinnedObject()
-                    let bDataPtr = bDataHandle.AddrOfPinnedObject()
+                    let enhPtr = enhHandle.AddrOfPinnedObject()
 
                     BitConverter.GetBytes(int64 rawPtr).CopyTo(inStruct, 0)
-                    BitConverter.GetBytes(80).CopyTo(inStruct, 0x10)
-                    BitConverter.GetBytes(5120 * 2).CopyTo(inStruct, 0x14)
-                    BitConverter.GetBytes(64us).CopyTo(inStruct, 0x18)
+                    BitConverter.GetBytes(80us).CopyTo(inStruct, 8)
+                    BitConverter.GetBytes(64us).CopyTo(inStruct, 10)
+                    BitConverter.GetBytes(0x01100000u).CopyTo(inStruct, 12)
+                    BitConverter.GetBytes(0u).CopyTo(inStruct, 16)
+                    BitConverter.GetBytes(10240u).CopyTo(inStruct, 20)
+                    BitConverter.GetBytes(1us).CopyTo(inStruct, 24)
 
-                    BitConverter.GetBytes(int64 bDataPtr).CopyTo(outStruct, 0)
-                    BitConverter.GetBytes(PreprocessedFrame.BDataSize).CopyTo(outStruct, 0x14)
+                    BitConverter.GetBytes(int64 enhPtr).CopyTo(outStruct, 0)
+                    BitConverter.GetBytes(uint32 PreprocessedFrame.PixelCount).CopyTo(outStruct, 0x14)
 
                     let rc =
                         nativeFunctions.PreProcessorUnify.Invoke(
                             inHandle.AddrOfPinnedObject(),
                             t1Handle.AddrOfPinnedObject(),
-                            t2Handle.AddrOfPinnedObject(),
+                            bDataHandle.AddrOfPinnedObject(),
                             outHandle.AddrOfPinnedObject(),
-                            qcHandle.AddrOfPinnedObject(),
-                            0u,
+                            enhHandle.AddrOfPinnedObject(),
+                            uint32 PreprocessedFrame.PixelCount,
                             qcHandle.AddrOfPinnedObject(),
                             0uy,
                             0uy
                         )
 
-                    let (qCalc, cCalc) = GoodixTodMatcher.ComputeQualityAndCoverage rawPixels
-                    let q =
-                        if rc = 0 && qualCov.[0] > 0 then QualityScore.createUnsafe (Math.Clamp(qualCov.[0], 25, 100))
-                        else QualityScore.createUnsafe (Math.Clamp(qCalc.Value, 25, 100))
-                    let c =
-                        if rc = 0 && qualCov.[1] > 0 then CoverageScore.createUnsafe (Math.Clamp(qualCov.[1], 25, 100))
-                        else CoverageScore.createUnsafe (Math.Clamp(cCalc.Value, 25, 100))
-                    let finalPixels = FrameDecoder.squash12To8BitLinear rawPixels
-                    PreprocessedFrame.create finalPixels bData q c
+                    if rc <> 0 then
+                        Error (ProtocolError $"PreProcessorUnify failed with return code {rc}")
+                    else
+                        let (qCalc, cCalc) = GoodixTodMatcher.ComputeQualityAndCoverage rawPixels
+                        let q =
+                            if qualCov.[1] > 0 then QualityScore.createUnsafe (Math.Clamp(qualCov.[1], 25, 100))
+                            elif qualCov.[0] > 0 then QualityScore.createUnsafe (Math.Clamp(qualCov.[0], 25, 100))
+                            else QualityScore.createUnsafe (Math.Clamp(qCalc.Value, 25, 100))
+                        let c =
+                            if qualCov.[0] > 0 then CoverageScore.createUnsafe (Math.Clamp(qualCov.[0], 25, 100))
+                            elif qualCov.[1] > 0 then CoverageScore.createUnsafe (Math.Clamp(qualCov.[1], 25, 100))
+                            else CoverageScore.createUnsafe (Math.Clamp(cCalc.Value, 25, 100))
+                        PreprocessedFrame.createWithTrailer enhBuf bData outStruct q c
                 finally
                     rawHandle.Free()
                     bDataHandle.Free()
+                    enhHandle.Free()
                     inHandle.Free()
                     outHandle.Free()
                     qcHandle.Free()
                     t1Handle.Free()
-                    t2Handle.Free()
             with ex ->
                 Error (InternalError ex)
         )
 
     member this.Preprocess(raw: RawFrame12Bit) : Result<PreprocessedFrame, DriverError> =
-        match this.PreprocessNative(raw) with
-        | Ok prep when prep.Quality.Value > 0 && prep.Coverage.Value > 0 -> Ok prep
-        | _ ->
-            lock syncLock (fun () ->
-                try
-                    let rawPixels =
-                        match baselineFrame with
-                        | Some b when b.Pixels.Length = raw.Pixels.Length ->
-                            Array.init raw.Pixels.Length (fun i -> uint16 (max 0 (int raw.Pixels.[i] - int b.Pixels.[i])))
-                        | _ -> raw.Pixels
-                    let (qual, cov) = GoodixTodMatcher.ComputeQualityAndCoverage rawPixels
-                    let q = QualityScore.createUnsafe (Math.Clamp(qual.Value, 25, 100))
-                    let c = CoverageScore.createUnsafe (Math.Clamp(cov.Value, 25, 100))
-                    let finalPixels = FrameDecoder.squash12To8BitLinear rawPixels
-                    let bData = Array.zeroCreate<byte> PreprocessedFrame.BDataSize
-                    PreprocessedFrame.create finalPixels bData q c
-                with ex ->
-                    Error (InternalError ex)
-            )
+        this.PreprocessNative(raw)
 
     member this.Preprocess(pixels: uint16[]) : Result<PreprocessedFrame, DriverError> =
         result {
@@ -245,12 +238,12 @@ type GoodixTodMatcher(nativeFunctions: NativeFunctions, baselineFrame: RawFrame1
                 Error (InternalError ex)
         )
 
-    member this.MergeSample(rawPixels: uint16[], enhancedPixels: byte[], quality: QualityScore, coverage: CoverageScore, ?bData: byte[]) : Result<int, DriverError> =
+    member this.MergeSample(rawPixels: uint16[], enhancedPixels: byte[], quality: QualityScore, coverage: CoverageScore, ?bData: byte[], ?outStruct: byte[]) : Result<int, DriverError> =
         lock syncLock (fun () ->
             try
                 let q = byte (Math.Clamp(quality.Value, 25, 100))
                 let c = byte (Math.Clamp(coverage.Value, 25, 100))
-                let pkt = GoodixTodMatcher.FormatImagePacket(rawPixels, enhancedPixels, q, c, ?bData = bData)
+                let pkt = GoodixTodMatcher.FormatImagePacket(rawPixels, enhancedPixels, q, c, ?bData = bData, ?outStruct = outStruct)
 
                 let pktHandle = GCHandle.Alloc(pkt, GCHandleType.Pinned)
                 try
@@ -288,7 +281,7 @@ type GoodixTodMatcher(nativeFunctions: NativeFunctions, baselineFrame: RawFrame1
     member this.MergeSample(rawPixels: uint16[]) : Result<int, DriverError> =
         result {
             let! prep = this.Preprocess(rawPixels)
-            return! this.MergeSample(rawPixels, prep.NormalizedPixels, prep.Quality, prep.Coverage, prep.BData)
+            return! this.MergeSample(rawPixels, prep.NormalizedPixels, prep.Quality, prep.Coverage, prep.BData, prep.OutStruct)
         }
 
     member this.CommitTemplate(?fingerId: FingerId) : Result<TemplateBlob, DriverError> =
@@ -332,10 +325,10 @@ type GoodixTodMatcher(nativeFunctions: NativeFunctions, baselineFrame: RawFrame1
     // Feature Identification / Match Probe
     // ------------------------------------------------------------------------
 
-    member this.IdentifyProbe(rawPixels: uint16[], enhancedPixels: byte[], templateBlob: byte[], quality: byte, coverage: byte, ?bData: byte[]) : Result<bool * int, DriverError> =
+    member this.IdentifyProbe(rawPixels: uint16[], enhancedPixels: byte[], templateBlob: byte[], quality: byte, coverage: byte, ?bData: byte[], ?outStruct: byte[]) : Result<bool * int, DriverError> =
         lock syncLock (fun () ->
             try
-                let pkt = GoodixTodMatcher.FormatImagePacket(rawPixels, enhancedPixels, quality, coverage, ?bData = bData)
+                let pkt = GoodixTodMatcher.FormatImagePacket(rawPixels, enhancedPixels, quality, coverage, ?bData = bData, ?outStruct = outStruct)
                 let pktHandle = GCHandle.Alloc(pkt, GCHandleType.Pinned)
                 try
                     let rcFmt = nativeFunctions.AlgFormatImageInterface.Invoke(pktHandle.AddrOfPinnedObject())
@@ -378,7 +371,7 @@ type GoodixTodMatcher(nativeFunctions: NativeFunctions, baselineFrame: RawFrame1
             let mutable matchedFinger = None
             for (fid, blob) in templates do
                 if matchedFinger.IsNone then
-                    let! (matched, _) = this.IdentifyProbe(rawPixels, prep.NormalizedPixels, blob.Value, q, c, prep.BData)
+                    let! (matched, _) = this.IdentifyProbe(rawPixels, prep.NormalizedPixels, blob.Value, q, c, prep.BData, prep.OutStruct)
                     if matched then
                         matchedFinger <- Some fid
             return matchedFinger
@@ -396,8 +389,8 @@ type GoodixTodMatcher(nativeFunctions: NativeFunctions, baselineFrame: RawFrame1
                 let rawSynthetic = Array.create RawFrame12Bit.ExpectedPixelCount 1500us
 
                 // Perform 12 sample enrollment iterations using candidate normalized pixels and b_data
-                for i in 0 .. 11 do
-                    let! _ = this.MergeSample(rawSynthetic, frame.NormalizedPixels, frame.Quality, frame.Coverage, frame.BData)
+                for _ in 0 .. 11 do
+                    let! _ = this.MergeSample(rawSynthetic, frame.NormalizedPixels, frame.Quality, frame.Coverage, frame.BData, frame.OutStruct)
                     ()
 
                 let! defaultFid = FingerId.create "DEFAULT_ENROLLED_FINGER"
@@ -410,7 +403,7 @@ type GoodixTodMatcher(nativeFunctions: NativeFunctions, baselineFrame: RawFrame1
                 let rawSynthetic = Array.create RawFrame12Bit.ExpectedPixelCount 1500us
                 let q = byte (Math.Clamp(candidate.Quality.Value, 25, 100))
                 let c = byte (Math.Clamp(candidate.Coverage.Value, 25, 100))
-                let! (matched, _) = this.IdentifyProbe(rawSynthetic, candidate.NormalizedPixels, enrolledTemplate, q, c, candidate.BData)
+                let! (matched, _) = this.IdentifyProbe(rawSynthetic, candidate.NormalizedPixels, enrolledTemplate, q, c, candidate.BData, candidate.OutStruct)
                 if matched then return 100.0
                 else return 0.0
             }

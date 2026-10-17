@@ -195,6 +195,7 @@ module RawFrame12Bit =
 type PreprocessedFrame = {
     NormalizedPixels: byte[]
     BData: byte[]
+    OutStruct: byte[]
     Quality: QualityScore
     Coverage: CoverageScore
 }
@@ -202,19 +203,29 @@ type PreprocessedFrame = {
 module PreprocessedFrame =
     let PixelCount = 5120
     let BDataSize = 19600
+    let OutStructSize = 28
 
-    let create (pixels: byte[]) (bData: byte[]) (quality: QualityScore) (coverage: CoverageScore) : Result<PreprocessedFrame, DriverError> =
+    let createWithTrailer (pixels: byte[]) (bData: byte[]) (outStruct: byte[]) (quality: QualityScore) (coverage: CoverageScore) : Result<PreprocessedFrame, DriverError> =
         if isNull pixels || pixels.Length <> PixelCount then
             Error (ValidationError ("PreprocessedFrame.NormalizedPixels", $"Expected {PixelCount} bytes, got {if isNull pixels then 0 else pixels.Length}"))
         elif isNull bData || bData.Length <> BDataSize then
             Error (ValidationError ("PreprocessedFrame.BData", $"Expected {BDataSize} bytes, got {if isNull bData then 0 else bData.Length}"))
         else
+            let trailer =
+                if isNull outStruct || outStruct.Length < OutStructSize then
+                    Array.zeroCreate<byte> OutStructSize
+                else
+                    Array.sub outStruct 0 OutStructSize
             Ok {
                 NormalizedPixels = Array.copy pixels
                 BData = Array.copy bData
+                OutStruct = trailer
                 Quality = quality
                 Coverage = coverage
             }
+
+    let create (pixels: byte[]) (bData: byte[]) (quality: QualityScore) (coverage: CoverageScore) : Result<PreprocessedFrame, DriverError> =
+        createWithTrailer pixels bData (Array.zeroCreate<byte> OutStructSize) quality coverage
 
 // ============================================================================
 // Fingerprint Matcher Interface

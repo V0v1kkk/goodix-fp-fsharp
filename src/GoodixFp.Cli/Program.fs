@@ -100,6 +100,14 @@ module CommandLine =
             Error "The 'enroll' command requires a finger name, e.g. 'goodix-fp enroll index_right'"
         | "verify" :: rest ->
             parseOptions rest { opts with Command = "verify" }
+        | "test-merge" :: raw :: rest ->
+            let (calib, remaining) =
+                match rest with
+                | c :: r when not (c.StartsWith("-")) -> (Some c, r)
+                | _ -> (None, rest)
+            parseOptions remaining { opts with Command = "test-merge"; Prefix = Some raw; FingerName = calib }
+        | "test-merge" :: rest ->
+            parseOptions rest { opts with Command = "test-merge" }
         | unknown :: _ ->
             Error $"Unknown command or argument '{unknown}'. Run 'goodix-fp help' for usage."
 
@@ -403,8 +411,9 @@ module DeviceRunner =
                                         with _ -> ()
                                     match matcher.MergeSample(frame.Pixels) with
                                     | Error err ->
-                                        eprintfn $"\n[!] Merge sample rejected: {err}"
-                                        failure <- true
+                                        eprintfn $"\n[!] Touch rejected ({err}), please lift finger and try step [{enrolledCount + 1}/12] again..."
+                                        let! _ = dev.WaitForFingerUp(timeoutMs = 5000)
+                                        ()
                                     | Ok count ->
                                         enrolledCount <- count
                                         printfn "Sample accepted! (Lift finger)"
@@ -714,8 +723,8 @@ module DeviceRunner =
                     let dy = float y - cy
                     let r = Math.Sqrt(dx * dx + dy * dy)
                     let theta = Math.Atan2(dy, dx)
-                    let ridge = Math.Sin(r * 0.8 - theta * 3.0)
-                    let rawVal = 2048.0 + 800.0 * ridge + noise * (float ((x * 17 + y * 31) % 50) - 25.0)
+                    let ridge = Math.Cos(r * 0.8 + 2.0 * theta)
+                    let rawVal = 1500.0 + 350.0 * ridge + noise * (float ((x * 17 + y * 31) % 10) - 5.0)
                     let clamped = Math.Clamp(rawVal, 0.0, 4095.0)
                     pixels.[y * width + x] <- uint16 clamped
             pixels
@@ -763,6 +772,57 @@ module DeviceRunner =
     let runBenchmark () : Task<int> =
         Task.FromResult(runBenchmarkSync ())
 
+    let runTestMerge (rawPath: string) (calibPath: string option) : Task<int> =
+        task {
+            let calibDesc = defaultArg calibPath "none"
+            printfn $"[*] Testing offline merge of '{rawPath}' (calib: {calibDesc})..."
+            if not (File.Exists rawPath) then
+                eprintfn $"[!] Raw PGM file not found: {rawPath}"
+                return 1
+            else
+                let rawBytes = File.ReadAllBytes rawPath
+                let rawPixels = FrameDecoder.fromPgm12Bit rawBytes
+                printfn $"[+] Loaded raw pixels: {rawPixels.Length} pixels"
+                let calibPixels =
+                    match calibPath with
+                    | Some cp when File.Exists cp ->
+                        let calibBytes = File.ReadAllBytes cp
+                        let p = FrameDecoder.fromPgm12Bit calibBytes
+                        printfn $"[+] Loaded calib pixels: {p.Length} pixels"
+                        Some p
+                    | _ -> None
+
+                let baselineFrame =
+                    match calibPixels with
+                    | Some p -> RawFrame12Bit.create p |> Result.toOption
+                    | None -> None
+
+                return! withMatcher baselineFrame (fun matcher -> task {
+                    printfn "[*] Calling StartEnroll()..."
+                    match matcher.StartEnroll() with
+                    | Error e ->
+                        eprintfn $"[!] StartEnroll failed: {e}"
+                        return 1
+                    | Ok () ->
+                        printfn "[*] Preprocessing raw frame..."
+                        match matcher.Preprocess(rawPixels) with
+                        | Error e ->
+                            eprintfn $"[!] Preprocess failed: {e}"
+                            return 1
+                        | Ok prep ->
+                            let nonZeroBData = prep.BData |> Array.filter ((<>) 0uy) |> Array.length
+                            printfn $"[+] Preprocess succeeded: Quality={prep.Quality.Value}, Coverage={prep.Coverage.Value}, BData={prep.BData.Length} bytes ({nonZeroBData} non-zero bytes)"
+                            printfn "[*] Calling MergeSample()..."
+                            match matcher.MergeSample(rawPixels, prep.NormalizedPixels, prep.Quality, prep.Coverage, prep.BData) with
+                            | Error e ->
+                                eprintfn $"[!] MergeSample failed: {e}"
+                                return 1
+                            | Ok count ->
+                                printfn $"[+] MergeSample succeeded! Enrolled sample count = {count}"
+                                return 0
+                })
+        }
+
 module Program =
 
     let printHelp () =
@@ -778,6 +838,7 @@ module Program =
         printfn "  enroll <finger-name>      12-touch interactive enrollment loop"
         printfn "  verify                    Verify finger against enrolled templates (PAM)"
         printfn "  benchmark                 Run Native AOT performance benchmark suite"
+        printfn "  test-merge <raw> [calib]  Test offline preprocessing & sample merging"
         printfn "  help                      Show this help message\n"
         printfn "Options:"
         printfn "  --calibrate-only          Run calibration capture only"
@@ -817,6 +878,10 @@ module Program =
                 (DeviceRunner.runVerify opts).GetAwaiter().GetResult()
             | "benchmark" ->
                 (DeviceRunner.runBenchmark ()).GetAwaiter().GetResult()
+            | "test-merge" ->
+                let raw = opts.Prefix |> Option.defaultValue "/tmp/goodix-fp/enroll-sample1-raw16.pgm"
+                let calib = opts.FingerName
+                (DeviceRunner.runTestMerge raw calib).GetAwaiter().GetResult()
             | other ->
                 eprintfn $"Unrecognized command '{other}'"
                 1
