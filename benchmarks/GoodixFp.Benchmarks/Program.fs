@@ -134,12 +134,10 @@ type TlsDecryptionBenchmark() =
 
     [<Benchmark(Baseline = true)>]
     member _.PureFSharp_Decrypt7684Bytes() : int =
-        // Reset seq num to avoid HMAC seq num drift during benchmark iterations
+        pureServer.ResetClientSeqNum()
         match (pureServer :> ITlsPskTunnel).DecryptApplicationData(encryptedPayloadForPure) with
         | Ok plain -> plain.Length
-        | Error _ ->
-            // Allow re-decrypting with same seq num
-            0
+        | Error _ -> 0
 
     [<Benchmark>]
     member _.BouncyCastle_Decrypt7684Bytes() : int =

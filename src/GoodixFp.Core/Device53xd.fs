@@ -82,15 +82,34 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
             System.Text.Encoding.ASCII.GetString(strBytes)
         let! fw = FirmwareVersion.create fwStr |> Result.mapError (fun err -> ValidationError ("FirmwareVersion", err))
 
-        // 3. Query Chip ID (Sensor Register 0x0000, 4 bytes)
+        // 3. Wake sensor chip before reading Chip ID
+        do! this.SendAndExpectAck(Protocol.packEnableChip true, Protocol.CommandEnableChip)
+
+        let resetPacket = Protocol.packReset true false 20uy
+        do! this.SendAndExpectAck(resetPacket, Protocol.CommandReset)
+        let! resetPayload = transport.Read(64, 2000)
+        let! _ =
+            match resetPayload with
+            | Protocol.CommandResponse (Protocol.CommandReset, payload) when payload.Length >= 1 && payload.[0] = 0x01uy ->
+                Ok ()
+            | _ ->
+                Error (ResetFailed "Reset response invalid or rejected")
+
+        // 4. Query Chip ID (Sensor Register 0x0000, 4 bytes)
+        // On 27c6:538d, payload is [0f a6 00 22] -> bytes [1..2] = 0x00a6. If byte 0 is not 0x0f or [1..2] is 0, fallback to [0..1].
         let! chipPayload = this.SendAndReceive(Protocol.packReadSensorRegister 0x0000us 4uy, Protocol.CommandReadSensorRegister)
         let chipRaw =
-            if chipPayload.Length >= 2 then
+            if chipPayload.Length >= 3 && chipPayload.[0] = 0x0fuy then
+                uint16 chipPayload.[1] ||| (uint16 chipPayload.[2] <<< 8)
+            elif chipPayload.Length >= 3 && (uint16 chipPayload.[1] ||| (uint16 chipPayload.[2] <<< 8)) <> 0us then
+                uint16 chipPayload.[1] ||| (uint16 chipPayload.[2] <<< 8)
+            elif chipPayload.Length >= 2 then
                 uint16 chipPayload.[0] ||| (uint16 chipPayload.[1] <<< 8)
-            else 0us
+            else
+                0us
         let! chip = ChipId.create chipRaw |> Result.mapError (fun err -> ValidationError ("ChipId", err))
 
-        // 4. Query OTP
+        // 5. Query OTP
         let! otpPayload = this.SendAndReceive(Protocol.packReadOtp(), Protocol.CommandReadOtp)
         let! otp = SensorOtp.parse otpPayload
         currentOtp <- Some otp
@@ -110,14 +129,26 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
         // Read current PSK status (flags = 0xbb020001)
         let readPskPacket = Protocol.packPresetPskRead 0xbb020001u (Some 32) (Some 0)
         let! pskPayload = this.SendAndReceive(readPskPacket, Protocol.CommandPresetPskReadR)
-        let pskValid = pskPayload.Length >= 1 && pskPayload.[0] = 0x00uy
+        let pskValid =
+            pskPayload.Length >= 41 &&
+            pskPayload.[0] = 0x00uy &&
+            ReadOnlySpan(pskPayload, 9, 32).SequenceEqual(ReadOnlySpan(Protocol.PmkHashZero))
 
         if not pskValid then
-            // Write PSK White-Box
-            let writePacket = Protocol.packPresetPskWrite 0xbb020001u Protocol.PskWhiteBox None None
+            // Write PSK White-Box with flag 0xbb010003u, chunk length 114, offset 0, and pre_flags
+            let writePacket = Protocol.packPresetPskWrite 0xbb010003u Protocol.PskWhiteBox (Some 114) (Some 0) (Some Protocol.PreFlagsPresetPskWrite)
             let! writeResp = this.SendAndReceive(writePacket, Protocol.CommandPresetPskWriteR)
             if writeResp.Length > 0 && writeResp.[0] = 0x00uy then
-                return ()
+                // Re-verify PSK status
+                let! recheckPayload = this.SendAndReceive(readPskPacket, Protocol.CommandPresetPskReadR)
+                let recheckValid =
+                    recheckPayload.Length >= 41 &&
+                    recheckPayload.[0] = 0x00uy &&
+                    ReadOnlySpan(recheckPayload, 9, 32).SequenceEqual(ReadOnlySpan(Protocol.PmkHashZero))
+                if recheckValid then
+                    return ()
+                else
+                    return! Error (ProtocolError "PSK verification failed after writing PSK White-Box")
             else
                 return! Error (ProtocolError "Failed to write PSK White-Box")
         else
@@ -129,6 +160,9 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
     // ------------------------------------------------------------------------
 
     member this.ActivateSession() : Task<Result<SensorOtp, DriverError>> = taskResult {
+        // Enable chip before reset
+        do! this.SendAndExpectAck(Protocol.packEnableChip true, Protocol.CommandEnableChip)
+
         // Reset device
         let resetPacket = Protocol.packReset true false 20uy
         do! this.SendAndExpectAck(resetPacket, Protocol.CommandReset)
@@ -175,18 +209,30 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
         let shPack = Protocol.encodeMessagePack Protocol.FlagsTransportLayerSecurity shBytes
         do! transport.Write(shPack)
 
-        // Read ClientKeyExchange + ChangeCipherSpec + Finished from device
-        let! clientFlightPack = transport.Read(1024, 2000)
-        let! clientFlightBytes =
-            match clientFlightPack with
-            | Protocol.MessagePack (Protocol.FlagsTransportLayerSecurity, bytes) -> Ok bytes
-            | _ -> Error (TlsHandshakeFailed "Unexpected packet while expecting ClientKeyExchange flight")
+        // Loop reading 0xb0 packs and feeding to tlsTunnel until server finished flight is produced
+        // (MCU may send ClientKeyExchange, ChangeCipherSpec, and Finished in 1, 2, or 3 separate 0xb0 MessagePacks)
+        let mutable serverFlightBytes: byte[] option = None
+        let mutable handshakeAttempts = 0
+        let maxAttempts = 5
 
-        let! serverFlight = tlsTunnel.HandleHandshake(clientFlightBytes)
+        while serverFlightBytes.IsNone && handshakeAttempts < maxAttempts do
+            handshakeAttempts <- handshakeAttempts + 1
+            let! clientFlightPack = transport.Read(1024, 2000)
+            let! clientPayload =
+                match clientFlightPack with
+                | Protocol.MessagePack (Protocol.FlagsTransportLayerSecurity, bytes) -> Ok bytes
+                | _ -> Error (TlsHandshakeFailed "Unexpected packet while expecting TLS handshake flight (FlagsTransportLayerSecurity)")
+            let! hsRes = tlsTunnel.HandleHandshake(clientPayload)
+            match hsRes with
+            | Some sfBytes ->
+                serverFlightBytes <- Some sfBytes
+            | None ->
+                ()
+
         let! sfBytes =
-            match serverFlight with
+            match serverFlightBytes with
             | Some bytes -> Ok bytes
-            | None -> Error (TlsHandshakeFailed "Server finished flight generation returned None")
+            | None -> Error (TlsHandshakeFailed "Handshake did not complete after reading client flight packets")
 
         // Send Server ChangeCipherSpec + Finished to device
         let sfPack = Protocol.encodeMessagePack Protocol.FlagsTransportLayerSecurity sfBytes

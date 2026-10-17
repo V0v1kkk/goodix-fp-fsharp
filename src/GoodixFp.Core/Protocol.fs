@@ -382,10 +382,15 @@ module Protocol =
         let inner = encodeMessageProtocol CommandReadSensorRegister msg true
         encodeMessagePack FlagsMessageProtocol inner
 
-    let packPresetPskWrite (flags: uint32) (payload: byte[]) (length: int option) (offset: int option) : byte[] =
+    /// 10-byte pre-flags for Goodix 53xd PresetPskWrite (0xbb010003)
+    let PreFlagsPresetPskWrite: byte[] =
+        Convert.FromHexString("56a5bb956b7c8d9e0000")
+
+    let packPresetPskWrite (flags: uint32) (payload: byte[]) (length: int option) (offset: int option) (preFlags: byte[] option) : byte[] =
+        let pre = defaultArg preFlags [||]
         let flagsBytes = BitConverter.GetBytes(flags)
         let payloadLenBytes = BitConverter.GetBytes(uint32 payload.Length)
-        let rawData = Array.concat [ flagsBytes; payloadLenBytes; payload ]
+        let rawData = Array.concat [ pre; flagsBytes; payloadLenBytes; payload ]
 
         let finalData =
             match length, offset with

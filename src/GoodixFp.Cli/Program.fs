@@ -2,7 +2,9 @@ namespace GoodixFp.Cli
 
 open System
 open System.IO
+open System.Diagnostics
 open System.Threading.Tasks
+open Org.BouncyCastle.Tls
 open FsToolkit.ErrorHandling
 open GoodixFp.Core
 open GoodixFp.NativeMatcher
@@ -60,6 +62,8 @@ module CommandLine =
         | [] -> Ok opts
         | "help" :: _ | "--help" :: _ | "-h" :: _ ->
             Ok { opts with Command = "help" }
+        | "benchmark" :: rest | "bench" :: rest ->
+            parseOptions rest { opts with Command = "benchmark" }
         | "probe" :: rest ->
             parseOptions rest { opts with Command = "probe" }
         | "provision-psk" :: rest ->
@@ -332,6 +336,289 @@ module DeviceRunner =
                             })
             })
 
+    let runBenchmarkSync () : int =
+        printfn "================================================================="
+        printfn "  Goodix FP Benchmark Suite (.NET 10 Native AOT / Linux-x64)"
+        printfn "=================================================================\n"
+
+        // --------------------------------------------------------------------
+        // [1/5] TLS 1.2 PSK Handshake: Pure F# vs BouncyCastle (200 iterations)
+        // --------------------------------------------------------------------
+        printfn "[1/5] TLS 1.2 PSK Handshake (200 iterations):"
+        let psk = Array.zeroCreate<byte> 32
+
+        // Warmup Pure F#
+        for _ in 1 .. 5 do
+            let client = new TlsClientProtocol()
+            client.Connect(TestPskTlsClient(psk))
+            use server = new PureFSharpTlsPskTunnel(psk)
+            let chLen = client.GetAvailableOutputBytes()
+            let chBuf = Array.zeroCreate<byte> chLen
+            client.ReadOutput(chBuf, 0, chLen) |> ignore
+            let shBytes = ((server :> ITlsPskTunnel).HandleHandshake(chBuf) |> Result.defaultWith (fun e -> failwith (string e))).Value
+            client.OfferInput(shBytes)
+            let cFlightLen = client.GetAvailableOutputBytes()
+            let cFlightBuf = Array.zeroCreate<byte> cFlightLen
+            client.ReadOutput(cFlightBuf, 0, cFlightLen) |> ignore
+            let sfBytes = ((server :> ITlsPskTunnel).HandleHandshake(cFlightBuf) |> Result.defaultWith (fun e -> failwith (string e))).Value
+            client.OfferInput(sfBytes)
+
+        let swPureHs = Stopwatch.StartNew()
+        for _ in 1 .. 200 do
+            let client = new TlsClientProtocol()
+            client.Connect(TestPskTlsClient(psk))
+            use server = new PureFSharpTlsPskTunnel(psk)
+            let chLen = client.GetAvailableOutputBytes()
+            let chBuf = Array.zeroCreate<byte> chLen
+            client.ReadOutput(chBuf, 0, chLen) |> ignore
+            let shBytes = ((server :> ITlsPskTunnel).HandleHandshake(chBuf) |> Result.defaultWith (fun e -> failwith (string e))).Value
+            client.OfferInput(shBytes)
+            let cFlightLen = client.GetAvailableOutputBytes()
+            let cFlightBuf = Array.zeroCreate<byte> cFlightLen
+            client.ReadOutput(cFlightBuf, 0, cFlightLen) |> ignore
+            let sfBytes = ((server :> ITlsPskTunnel).HandleHandshake(cFlightBuf) |> Result.defaultWith (fun e -> failwith (string e))).Value
+            client.OfferInput(sfBytes)
+        swPureHs.Stop()
+
+        let usPureHs = float swPureHs.ElapsedTicks * 1_000_000.0 / float Stopwatch.Frequency / 200.0
+        let opsPureHs = 200.0 / swPureHs.Elapsed.TotalSeconds
+        printfn $"  Pure F# RFC 4279/5246 : {usPureHs,7:F1} us/op | {opsPureHs,7:F1} handshakes/sec"
+
+        // Warmup BouncyCastle
+        for _ in 1 .. 5 do
+            let client = new TlsClientProtocol()
+            client.Connect(TestPskTlsClient(psk))
+            use server = new BouncyCastleTlsPskTunnel(psk)
+            let pump () =
+                let cAvail = client.GetAvailableOutputBytes()
+                if cAvail > 0 then
+                    let cBuf = Array.zeroCreate<byte> cAvail
+                    client.ReadOutput(cBuf, 0, cAvail) |> ignore
+                    match (server :> ITlsPskTunnel).HandleHandshake(cBuf) with
+                    | Ok (Some sResp) -> client.OfferInput(sResp)
+                    | _ -> ()
+            let mutable iters = 0
+            while (not client.IsConnected || not (server :> ITlsPskTunnel).IsHandshakeComplete) && iters < 10 do
+                pump ()
+                iters <- iters + 1
+
+        let swBcHs = Stopwatch.StartNew()
+        for _ in 1 .. 200 do
+            let client = new TlsClientProtocol()
+            client.Connect(TestPskTlsClient(psk))
+            use server = new BouncyCastleTlsPskTunnel(psk)
+            let pump () =
+                let cAvail = client.GetAvailableOutputBytes()
+                if cAvail > 0 then
+                    let cBuf = Array.zeroCreate<byte> cAvail
+                    client.ReadOutput(cBuf, 0, cAvail) |> ignore
+                    match (server :> ITlsPskTunnel).HandleHandshake(cBuf) with
+                    | Ok (Some sResp) -> client.OfferInput(sResp)
+                    | _ -> ()
+            let mutable iters = 0
+            while (not client.IsConnected || not (server :> ITlsPskTunnel).IsHandshakeComplete) && iters < 10 do
+                pump ()
+                iters <- iters + 1
+        swBcHs.Stop()
+
+        let usBcHs = float swBcHs.ElapsedTicks * 1_000_000.0 / float Stopwatch.Frequency / 200.0
+        let opsBcHs = 200.0 / swBcHs.Elapsed.TotalSeconds
+        let speedupHs = usBcHs / usPureHs
+        printfn $"  BouncyCastle (Native) : {usBcHs,7:F1} us/op | {opsBcHs,7:F1} handshakes/sec"
+        printfn $"  Speedup (Pure vs BC)  : {speedupHs:F2}x faster\n"
+
+        // --------------------------------------------------------------------
+        // [2/5] TLS 7,684-byte Frame Decryption (5,000 iterations)
+        // --------------------------------------------------------------------
+        printfn "[2/5] TLS 7,684-byte Frame Decryption (5,000 iterations):"
+        let frame7684 = Array.init 7684 (fun i -> byte (i &&& 0xff))
+
+        let pureDecClient = new TlsClientProtocol()
+        pureDecClient.Connect(TestPskTlsClient(psk))
+        use pureDecServer = new PureFSharpTlsPskTunnel(psk)
+
+        let chDecLen = pureDecClient.GetAvailableOutputBytes()
+        let chDecBuf = Array.zeroCreate<byte> chDecLen
+        pureDecClient.ReadOutput(chDecBuf, 0, chDecLen) |> ignore
+        let shDecBytes = ((pureDecServer :> ITlsPskTunnel).HandleHandshake(chDecBuf) |> Result.defaultWith (fun e -> failwith (string e))).Value
+        pureDecClient.OfferInput(shDecBytes)
+
+        let cfDecLen = pureDecClient.GetAvailableOutputBytes()
+        let cfDecBuf = Array.zeroCreate<byte> cfDecLen
+        pureDecClient.ReadOutput(cfDecBuf, 0, cfDecLen) |> ignore
+        let sfDecBytes = ((pureDecServer :> ITlsPskTunnel).HandleHandshake(cfDecBuf) |> Result.defaultWith (fun e -> failwith (string e))).Value
+        pureDecClient.OfferInput(sfDecBytes)
+
+        pureDecClient.WriteApplicationData(frame7684, 0, frame7684.Length)
+        let appDecLen = pureDecClient.GetAvailableOutputBytes()
+        let appDecBuf = Array.zeroCreate<byte> appDecLen
+        pureDecClient.ReadOutput(appDecBuf, 0, appDecLen) |> ignore
+
+        let encryptedPayloadForPure = Array.concat [
+            [| 0xb2uy; 0x00uy; 0x20uy; 0xd2uy; 0x00uy; 0x00uy; 0x00uy; 0x00uy; 0x00uy |]
+            appDecBuf
+        ]
+
+        // Warmup
+        for _ in 1 .. 50 do
+            pureDecServer.ResetClientSeqNum()
+            (pureDecServer :> ITlsPskTunnel).DecryptApplicationData(encryptedPayloadForPure) |> ignore
+
+        let swDec = Stopwatch.StartNew()
+        for _ in 1 .. 5000 do
+            pureDecServer.ResetClientSeqNum()
+            match (pureDecServer :> ITlsPskTunnel).DecryptApplicationData(encryptedPayloadForPure) with
+            | Ok plain -> ()
+            | Error err -> failwith $"Decryption failed: {err}"
+        swDec.Stop()
+
+        let usDec = float swDec.ElapsedTicks * 1_000_000.0 / float Stopwatch.Frequency / 5000.0
+        let fpsDec = 5000.0 / swDec.Elapsed.TotalSeconds
+        let mbsDec = (float (5000L * 7684L) / (1024.0 * 1024.0)) / swDec.Elapsed.TotalSeconds
+        printfn $"  Pure F# Decrypt       : {usDec,7:F1} us/frame | {mbsDec,7:F1} MB/s | {fpsDec,7:F1} frames/sec\n"
+
+        // --------------------------------------------------------------------
+        // [3/5] FrameDecoder 80x64 Unpack & Transpose (20,000 iterations)
+        // --------------------------------------------------------------------
+        printfn "[3/5] FrameDecoder 80x64 Unpack & Transpose (20,000 iterations):"
+        let packed = Array.zeroCreate<byte> FrameDecoder.PackedFrameSize
+        let rnd = Random(12345)
+        rnd.NextBytes(packed)
+        let spanDest = Array.zeroCreate<uint16> FrameDecoder.PixelCount
+
+        // Warmup
+        for _ in 1 .. 100 do
+            FrameDecoder.unpackSequential packed |> ignore
+            FrameDecoder.unpackAndTranspose80x64 packed |> ignore
+            FrameDecoder.unpackAndTranspose80x64Span (ReadOnlySpan packed) (Span spanDest) |> ignore
+
+        let swSeq = Stopwatch.StartNew()
+        for _ in 1 .. 20000 do
+            FrameDecoder.unpackSequential packed |> ignore
+        swSeq.Stop()
+        let usSeq = float swSeq.ElapsedTicks * 1_000_000.0 / float Stopwatch.Frequency / 20000.0
+        let fpsSeq = 20000.0 / swSeq.Elapsed.TotalSeconds
+        printfn $"  Sequential Array      : {usSeq,7:F1} us/frame | {fpsSeq,7:F1} FPS"
+
+        let swTransArr = Stopwatch.StartNew()
+        for _ in 1 .. 20000 do
+            FrameDecoder.unpackAndTranspose80x64 packed |> ignore
+        swTransArr.Stop()
+        let usTransArr = float swTransArr.ElapsedTicks * 1_000_000.0 / float Stopwatch.Frequency / 20000.0
+        let fpsTransArr = 20000.0 / swTransArr.Elapsed.TotalSeconds
+        printfn $"  Transpose Array       : {usTransArr,7:F1} us/frame | {fpsTransArr,7:F1} FPS"
+
+        let pSpan = ReadOnlySpan packed
+        let dSpan = Span spanDest
+        let swTransSpan = Stopwatch.StartNew()
+        for _ in 1 .. 20000 do
+            FrameDecoder.unpackAndTranspose80x64Span pSpan dSpan |> ignore
+        swTransSpan.Stop()
+        let usTransSpan = float swTransSpan.ElapsedTicks * 1_000_000.0 / float Stopwatch.Frequency / 20000.0
+        let fpsTransSpan = 20000.0 / swTransSpan.Elapsed.TotalSeconds
+        printfn $"  Transpose Span (Zero) : {usTransSpan,7:F1} us/frame | {fpsTransSpan,7:F1} FPS\n"
+
+        // --------------------------------------------------------------------
+        // [4/5] Packet Framing & CRC32 (50,000 iterations)
+        // --------------------------------------------------------------------
+        printfn "[4/5] Packet Framing & CRC32 (50,000 iterations):"
+        let rawConfig = Protocol.Goodix53xdConfig
+        let inner = Protocol.encodeMessageProtocol Protocol.CommandUploadConfigMcu rawConfig true
+        let encodedPack = Protocol.encodeMessagePack Protocol.FlagsMessageProtocol inner
+
+        // Warmup
+        for _ in 1 .. 100 do
+            match encodedPack with
+            | Protocol.AckResponse _ -> ()
+            | Protocol.CommandResponse _ -> ()
+            | Protocol.InvalidPacket _ -> ()
+            Crc32.compute (ReadOnlySpan rawConfig) |> ignore
+
+        let swAp = Stopwatch.StartNew()
+        for _ in 1 .. 50000 do
+            match encodedPack with
+            | Protocol.AckResponse _ -> ()
+            | Protocol.CommandResponse _ -> ()
+            | Protocol.InvalidPacket _ -> ()
+        swAp.Stop()
+        let usAp = float swAp.ElapsedTicks * 1_000_000.0 / float Stopwatch.Frequency / 50000.0
+        let opsAp = 50000.0 / swAp.Elapsed.TotalSeconds
+        printfn $"  ActivePattern Classify: {usAp,7:F2} us/op    | {opsAp,9:F1} ops/sec"
+
+        let configSpan = ReadOnlySpan rawConfig
+        let swCrc = Stopwatch.StartNew()
+        for _ in 1 .. 50000 do
+            Crc32.compute configSpan |> ignore
+        swCrc.Stop()
+        let usCrc = float swCrc.ElapsedTicks * 1_000_000.0 / float Stopwatch.Frequency / 50000.0
+        let mbsCrc = (float (50000L * int64 rawConfig.Length) / (1024.0 * 1024.0)) / swCrc.Elapsed.TotalSeconds
+        printfn $"  CRC32 (7,680 bytes)   : {usCrc,7:F2} us/op    | {mbsCrc,7:F1} MB/s\n"
+
+        // --------------------------------------------------------------------
+        // [5/5] Goodix TOD Native Matcher: Preprocess & Identify (500 iterations)
+        // --------------------------------------------------------------------
+        printfn "[5/5] Goodix TOD Native Matcher (500 iterations):"
+        let generateSyntheticRidgeFrame (shiftX: float) (shiftY: float) (noise: float) : uint16[] =
+            let width = 80
+            let height = 64
+            let cx = 40.0 + shiftX
+            let cy = 32.0 + shiftY
+            let pixels = Array.zeroCreate<uint16> (width * height)
+            for y in 0 .. height - 1 do
+                for x in 0 .. width - 1 do
+                    let dx = float x - cx
+                    let dy = float y - cy
+                    let r = Math.Sqrt(dx * dx + dy * dy)
+                    let theta = Math.Atan2(dy, dx)
+                    let ridge = Math.Sin(r * 0.8 - theta * 3.0)
+                    let rawVal = 2048.0 + 800.0 * ridge + noise * (float ((x * 17 + y * 31) % 50) - 25.0)
+                    let clamped = Math.Clamp(rawVal, 0.0, 4095.0)
+                    pixels.[y * width + x] <- uint16 clamped
+            pixels
+
+        match GoodixTodMatcher.Create() with
+        | Error err ->
+            eprintfn $"  [!] Goodix TOD native matcher not available: {err}"
+        | Ok matcher ->
+            use _m = matcher
+            matcher.StartEnroll() |> ignore
+            for i in 0 .. 11 do
+                let sx = float (i % 3 - 1) * 1.5
+                let sy = float (i / 3 - 2) * 1.5
+                let sample = generateSyntheticRidgeFrame sx sy 1.0
+                matcher.MergeSample(sample) |> ignore
+
+            let fid = FingerId.createUnsafe "bench_finger"
+            let blob = matcher.CommitTemplate(fid) |> Result.defaultWith (fun e -> failwith (string e))
+            let templates = [ (fid, blob) ]
+            let testFrame = generateSyntheticRidgeFrame 0.5 0.5 1.0
+
+            // Warmup
+            for _ in 1 .. 10 do
+                matcher.Preprocess(testFrame) |> ignore
+                matcher.IdentifyProbe(testFrame, templates) |> ignore
+
+            let swPrep = Stopwatch.StartNew()
+            for _ in 1 .. 500 do
+                matcher.Preprocess(testFrame) |> ignore
+            swPrep.Stop()
+            let usPrep = float swPrep.ElapsedTicks * 1_000_000.0 / float Stopwatch.Frequency / 500.0
+            let fpsPrep = 500.0 / swPrep.Elapsed.TotalSeconds
+            printfn $"  PreProcessorUnify     : {usPrep,7:F1} us/frame | {fpsPrep,7:F1} FPS"
+
+            let swId = Stopwatch.StartNew()
+            for _ in 1 .. 500 do
+                matcher.IdentifyProbe(testFrame, templates) |> ignore
+            swId.Stop()
+            let usId = float swId.ElapsedTicks * 1_000_000.0 / float Stopwatch.Frequency / 500.0
+            let idSec = 500.0 / swId.Elapsed.TotalSeconds
+            printfn $"  1:1 Probe Identify    : {usId,7:F1} us/match | {idSec,7:F1} matches/sec"
+
+        0
+
+    let runBenchmark () : Task<int> =
+        Task.FromResult(runBenchmarkSync ())
+
 module Program =
 
     let printHelp () =
@@ -345,6 +632,7 @@ module Program =
         printfn "  capture [prefix]          Capture baseline & frame, export PGM images"
         printfn "  enroll <finger-name>      12-touch interactive enrollment loop"
         printfn "  verify                    Verify finger against enrolled templates (PAM)"
+        printfn "  benchmark                 Run Native AOT performance benchmark suite"
         printfn "  help                      Show this help message\n"
         printfn "Options:"
         printfn "  --tls <pure|bc>           TLS PSK engine (default: pure)"
@@ -377,6 +665,8 @@ module Program =
                 (DeviceRunner.runEnroll opts name).GetAwaiter().GetResult()
             | "verify" ->
                 (DeviceRunner.runVerify opts).GetAwaiter().GetResult()
+            | "benchmark" ->
+                (DeviceRunner.runBenchmark ()).GetAwaiter().GetResult()
             | other ->
                 eprintfn $"Unrecognized command '{other}'"
                 1
