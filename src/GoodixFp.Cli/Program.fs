@@ -155,8 +155,8 @@ module DeviceRunner =
                 devDisp.Dispose()
     }
 
-    let withMatcher (action: GoodixTodMatcher -> Task<int>) : Task<int> = task {
-        match GoodixTodMatcher.Create() with
+    let withMatcher (baseline: RawFrame12Bit option) (action: GoodixTodMatcher -> Task<int>) : Task<int> = task {
+        match GoodixTodMatcher.Create(?baseline = baseline) with
         | Error err ->
             eprintfn $"[!] Failed to initialize Goodix TOD matcher: {err}"
             return 1
@@ -283,23 +283,26 @@ module DeviceRunner =
                 eprintfn $"[!] Session activation failed: {err}"
                 return 1
             | Ok _ ->
-                printfn "[*] Capturing baseline calibration frame (no touch)..."
-                let! capRes = dev.CaptureFrame()
-                match capRes with
-                | Error err ->
-                    eprintfn $"[!] Calibration frame capture failed: {err}"
-                    return 1
-                | Ok rawFrame ->
-                    let! _ = dev.Sleep()
-                    let rawPgm = FrameDecoder.toPgm12Bit rawFrame.Pixels 80 64
-                    let outPath = $"{prefix}-baseline16.pgm"
-                    let dir = Path.GetDirectoryName(outPath)
-                    if not (String.IsNullOrWhiteSpace dir) && not (Directory.Exists dir) then
-                        Directory.CreateDirectory(dir) |> ignore
-                    File.WriteAllBytes(outPath, rawPgm)
-                    printfn $"[+] Verified GoodixFrameCrc on {rawPgm.Length} bytes frame payload."
-                    printfn $"[+] Saved baseline 16-bit PGM image: {outPath}"
-                    return 0
+                printfn "[*] Baseline calibration frame captured during ActivateSession (no touch)..."
+                let! rawFrame = task {
+                    match dev.BaselineFrame with
+                    | Some b -> return b
+                    | None ->
+                        let! capRes = dev.CaptureFrame()
+                        match capRes with
+                        | Ok f -> return f
+                        | Error err -> return failwith $"Failed to capture frame: {err}"
+                }
+                let! _ = dev.Sleep()
+                let rawPgm = FrameDecoder.toPgm12Bit rawFrame.Pixels 80 64
+                let outPath = $"{prefix}-baseline16.pgm"
+                let dir = Path.GetDirectoryName(outPath)
+                if not (String.IsNullOrWhiteSpace dir) && not (Directory.Exists dir) then
+                    Directory.CreateDirectory(dir) |> ignore
+                File.WriteAllBytes(outPath, rawPgm)
+                printfn $"[+] Verified GoodixFrameCrc on {rawPgm.Length} bytes frame payload."
+                printfn $"[+] Saved baseline 16-bit PGM image: {outPath}"
+                return 0
         })
 
     let runCapture (opts: CliOptions) : Task<int> =
@@ -359,7 +362,7 @@ module DeviceRunner =
                 eprintfn $"[!] Session activation failed: {err}"
                 return 1
             | Ok _ ->
-                return! withMatcher (fun matcher -> task {
+                return! withMatcher dev.BaselineFrame (fun matcher -> task {
                     match matcher.StartEnroll() with
                     | Error err ->
                         eprintfn $"[!] Start enrollment failed: {err}"
@@ -370,6 +373,7 @@ module DeviceRunner =
 
                         while enrolledCount < 12 && not failure do
                             printf $"--> [{enrolledCount + 1}/12] Place finger on sensor: "
+                            Console.Out.Flush()
                             let! downRes = dev.WaitForFingerDown(timeoutMs = 20000)
                             match downRes with
                             | Error err ->
@@ -377,6 +381,7 @@ module DeviceRunner =
                                 failure <- true
                             | Ok () ->
                                 printf "Capturing... "
+                                Console.Out.Flush()
                                 let! capRes = dev.CaptureFrame()
                                 match capRes with
                                 | Error err ->
@@ -384,6 +389,18 @@ module DeviceRunner =
                                     failure <- true
                                 | Ok frame ->
                                     let! _ = dev.WaitForFingerUp(timeoutMs = 5000)
+                                    if enrolledCount = 0 then
+                                        try
+                                            let dir = "/tmp/goodix-fp"
+                                            if not (Directory.Exists dir) then Directory.CreateDirectory dir |> ignore
+                                            let sampleRawPgm = FrameDecoder.toPgm12Bit frame.Pixels 80 64
+                                            File.WriteAllBytes(Path.Combine(dir, "enroll-sample1-raw16.pgm"), sampleRawPgm)
+                                            match matcher.Preprocess(frame) with
+                                            | Ok p ->
+                                                let enhPgm = FrameDecoder.toPgm8Bit p.NormalizedPixels 80 64
+                                                File.WriteAllBytes(Path.Combine(dir, "enroll-sample1-enhanced8.pgm"), enhPgm)
+                                            | _ -> ()
+                                        with _ -> ()
                                     match matcher.MergeSample(frame.Pixels) with
                                     | Error err ->
                                         eprintfn $"\n[!] Merge sample rejected: {err}"
@@ -391,6 +408,7 @@ module DeviceRunner =
                                     | Ok count ->
                                         enrolledCount <- count
                                         printfn "Sample accepted! (Lift finger)"
+                                        Console.Out.Flush()
 
                         let! _ = dev.Sleep()
 
@@ -430,6 +448,7 @@ module DeviceRunner =
                     return 1
                 | Ok _ ->
                     printfn "[*] Touch sensor to verify..."
+                    Console.Out.Flush()
                     let! downRes = dev.WaitForFingerDown(timeoutMs = 15000)
                     match downRes with
                     | Error _ ->
@@ -437,6 +456,7 @@ module DeviceRunner =
                         return 1
                     | Ok () ->
                         printfn "[*] Finger detected. Capturing probe..."
+                        Console.Out.Flush()
                         let! capRes = dev.CaptureFrame()
                         match capRes with
                         | Error err ->
@@ -446,7 +466,7 @@ module DeviceRunner =
                             let! _ = dev.WaitForFingerUp(timeoutMs = 3000)
                             let! _ = dev.Sleep()
 
-                            return! withMatcher (fun matcher -> task {
+                            return! withMatcher dev.BaselineFrame (fun matcher -> task {
                                 match matcher.IdentifyProbe(frame.Pixels, templates) with
                                 | Error err ->
                                     eprintfn $"[!] Identification failed: {err}"

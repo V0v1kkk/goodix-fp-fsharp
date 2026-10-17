@@ -361,6 +361,10 @@ module Protocol =
         let inner = encodeMessageProtocol CommandMcuSwitchToFdtMode mode true
         encodeMessagePack FlagsMessageProtocol inner
 
+    let packQueryMcuState (payload: byte[]) : byte[] =
+        let inner = encodeMessageProtocol CommandQueryMcuState payload true
+        encodeMessagePack FlagsMessageProtocol inner
+
     let packRequestTlsConnection () : byte[] =
         let payload = [| 0x00uy; 0x00uy |]
         let inner = encodeMessageProtocol CommandRequestTlsConnection payload true

@@ -21,6 +21,8 @@ type DeviceInfo = {
 type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
 
     let mutable currentOtp: SensorOtp option = None
+    let mutable baselineFrame: RawFrame12Bit option = None
+    let mutable lastFdtUpBase: byte[] option = None
 
     new(transport: IUsbTransport) =
         new Goodix53xdDevice(transport, new PureFSharpTlsPskTunnel())
@@ -28,6 +30,8 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
     member this.Transport = transport
     member this.TlsTunnel = tlsTunnel
     member this.CurrentOtp = currentOtp
+    member this.BaselineFrame = baselineFrame
+    member this.LastFdtUpBase = lastFdtUpBase
 
     // ------------------------------------------------------------------------
     // Low-Level Packet Exchange Helpers
@@ -363,7 +367,120 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
         if uploadResp.Length = 0 || uploadResp.[0] <> 0x01uy then
             do! Error (ProtocolError "Failed to upload MCU config")
 
+        // 8. FDT Baseline Calibration sequence (matching driver_53xd.py / Milan TOD)
+        let dacBytes = [|
+            otp.FdtDac.[0]; 0x01uy
+            otp.FdtDac.[1]; 0x01uy
+            otp.FdtDac.[2]; 0x01uy
+            otp.FdtDac.[3]; 0x01uy
+        |]
+        let dacBytesMinus15 = [|
+            byte (max 0 (int otp.FdtDac.[0] - 15)); 0x01uy
+            byte (max 0 (int otp.FdtDac.[1] - 15)); 0x01uy
+            byte (max 0 (int otp.FdtDac.[2] - 15)); 0x01uy
+            byte (max 0 (int otp.FdtDac.[3] - 15)); 0x01uy
+        |]
+        let zeros16 = Array.zeroCreate<byte> 16
+
+        let makeFdtModePacket (modeByte: byte) (reply: bool) =
+            let replyByte = if reply then 0x01uy else 0x00uy
+            Array.concat [| [| modeByte; 0x01uy |]; dacBytes; zeros16; [| replyByte |] |]
+
+        // 8.1: mcu_switch_to_fdt_mode(0x0d... 0, false)
+        let fdt0dNoReply = makeFdtModePacket 0x0duy false
+        do! this.SendAndExpectAck(Protocol.packSwitchToFdtMode fdt0dNoReply, Protocol.CommandMcuSwitchToFdtMode)
+
+        // 8.2: mcu_switch_to_fdt_mode(0x0d... 1, true)
+        let fdt0dWait = makeFdtModePacket 0x0duy true
+        do! this.SendAndExpectAck(Protocol.packSwitchToFdtMode fdt0dWait, Protocol.CommandMcuSwitchToFdtMode)
+        let! _ = this.ReadCommandResponse(Protocol.CommandMcuSwitchToFdtMode, 2000)
+
+        // 8.3: write_sensor_register 0x022c = [0x0a, 0x03]
+        do! this.SendAndExpectAck(Protocol.packWriteSensorRegister 0x022cus [| 0x0auy; 0x03uy |], Protocol.CommandWriteSensorRegister)
+
+        // 8.4: get_image clear-0 ([0x01, 0x03, dacBytes])
+        let imgClear0 = Array.concat [| [| 0x01uy; 0x03uy |]; dacBytes |]
+        let! _clear0 = this.CaptureRawFrameInternal(imgClear0)
+
+        // 8.5: write_sensor_register 0x022c = [0x0a, 0x02]
+        do! this.SendAndExpectAck(Protocol.packWriteSensorRegister 0x022cus [| 0x0auy; 0x02uy |], Protocol.CommandWriteSensorRegister)
+
+        // 8.6: write_sensor_register 0x022c = [0x0a, 0x03]
+        do! this.SendAndExpectAck(Protocol.packWriteSensorRegister 0x022cus [| 0x0auy; 0x03uy |], Protocol.CommandWriteSensorRegister)
+
+        // 8.7: get_image clear-1 ([0x81, 0x03, dacBytes])
+        let imgClear1 = Array.concat [| [| 0x81uy; 0x03uy |]; dacBytes |]
+        let! _clear1 = this.CaptureRawFrameInternal(imgClear1)
+
+        // 8.8: write_sensor_register 0x022c = [0x0a, 0x02]
+        do! this.SendAndExpectAck(Protocol.packWriteSensorRegister 0x022cus [| 0x0auy; 0x02uy |], Protocol.CommandWriteSensorRegister)
+
+        // 8.9: write_sensor_register 0x022c = [0x0a, 0x03]
+        do! this.SendAndExpectAck(Protocol.packWriteSensorRegister 0x022cus [| 0x0auy; 0x03uy |], Protocol.CommandWriteSensorRegister)
+
+        // 8.10: get_image clear-2 ([0x81, 0x03, dacBytesMinus15])
+        let imgClear2 = Array.concat [| [| 0x81uy; 0x03uy |]; dacBytesMinus15 |]
+        let! _clear2 = this.CaptureRawFrameInternal(imgClear2)
+
+        // 8.11: write_sensor_register 0x022c = [0x0a, 0x02]
+        do! this.SendAndExpectAck(Protocol.packWriteSensorRegister 0x022cus [| 0x0auy; 0x02uy |], Protocol.CommandWriteSensorRegister)
+
+        // 8.12: mcu_switch_to_fdt_mode(0x8d... 0, false)
+        let fdt8dNoReply = makeFdtModePacket 0x8duy false
+        do! this.SendAndExpectAck(Protocol.packSwitchToFdtMode fdt8dNoReply, Protocol.CommandMcuSwitchToFdtMode)
+
+        // 8.13: mcu_switch_to_fdt_mode(0x8d... 1, true)
+        let fdt8dWait = makeFdtModePacket 0x8duy true
+        do! this.SendAndExpectAck(Protocol.packSwitchToFdtMode fdt8dWait, Protocol.CommandMcuSwitchToFdtMode)
+        let! _ = this.ReadCommandResponse(Protocol.CommandMcuSwitchToFdtMode, 2000)
+
+        // 8.14: write_sensor_register 0x022c = [0x0a, 0x03]
+        do! this.SendAndExpectAck(Protocol.packWriteSensorRegister 0x022cus [| 0x0auy; 0x03uy |], Protocol.CommandWriteSensorRegister)
+
+        // 8.15: get_image clear-3 ([0x81, 0x03, dacBytes]) -> baseline dark frame
+        let imgClear3 = Array.concat [| [| 0x81uy; 0x03uy |]; dacBytes |]
+        let! clear3 = this.CaptureRawFrameInternal(imgClear3)
+        baselineFrame <- Some clear3
+
+        // 8.16: write_sensor_register 0x022c = [0x0a, 0x02]
+        do! this.SendAndExpectAck(Protocol.packWriteSensorRegister 0x022cus [| 0x0auy; 0x02uy |], Protocol.CommandWriteSensorRegister)
+
+        // 8.17: mcu_switch_to_fdt_mode(0x0d... 0, false)
+        do! this.SendAndExpectAck(Protocol.packSwitchToFdtMode fdt0dNoReply, Protocol.CommandMcuSwitchToFdtMode)
+
+        // 8.18: mcu_switch_to_fdt_mode(0x0d... 1, true)
+        do! this.SendAndExpectAck(Protocol.packSwitchToFdtMode fdt0dWait, Protocol.CommandMcuSwitchToFdtMode)
+        let! _ = this.ReadCommandResponse(Protocol.CommandMcuSwitchToFdtMode, 2000)
+
+        // 8.19: mcu_switch_to_sleep_mode
+        do! this.SendAndExpectAck(Protocol.packSwitchToSleepMode(), Protocol.CommandMcuSwitchToSleepMode)
+
+        // 8.20: query_mcu_state([0x01, 0x01, 0x01])
+        do! this.SendAndExpectAck(Protocol.packQueryMcuState [| 0x01uy; 0x01uy; 0x01uy |], Protocol.CommandQueryMcuState)
+
         return otp
+    }
+
+    // ------------------------------------------------------------------------
+    // Internal Frame Capture Helper
+    // ------------------------------------------------------------------------
+
+    member private this.CaptureRawFrameInternal(imgPayload: byte[]) : Task<Result<RawFrame12Bit, DriverError>> = taskResult {
+        let imgReq = Protocol.packGetImage imgPayload Protocol.FlagsTransportLayerSecurityData
+        do! this.SendAndExpectAck(imgReq, Protocol.CommandMcuGetImage)
+
+        // Read encrypted application data (7684 frame payload + TLS record wrapping)
+        let! encryptedPack = transport.Read(8192, 5000)
+
+        // Decrypt application data via TLS-PSK tunnel
+        let! decrypted = tlsTunnel.DecryptApplicationData(encryptedPack)
+
+        // Verify CRC32
+        do! GoodixFrameCrc.verify (ReadOnlySpan decrypted)
+
+        // Unpack and transpose pixels into 80x64
+        let! pixels = FrameDecoder.unpackAndTranspose80x64 (Array.take FrameDecoder.PackedFrameSize decrypted)
+        return! RawFrame12Bit.create pixels
     }
 
     // ------------------------------------------------------------------------
@@ -377,21 +494,46 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
             | Some o -> o
             | None -> { Raw = Array.zeroCreate 64; DacH = 0x28uy; DacL = 0x24uy; FdtDac = [| 0x91uy; 0x8buy; 0x96uy; 0x91uy |] }
 
-        // Switch to FDT down mode
-        let fdtPayload = [|
-            0x8cuy; 0x01uy
-            0x28uy; 0x01uy; 0x22uy; 0x01uy; 0x28uy; 0x01uy; 0x24uy; 0x01uy
-            otp.FdtDac.[0]; otp.FdtDac.[0]; otp.FdtDac.[1]; otp.FdtDac.[1]
-            otp.FdtDac.[2]; otp.FdtDac.[2]; otp.FdtDac.[3]; otp.FdtDac.[3]
-            0x98uy; 0x98uy; 0x90uy; 0x90uy; 0x92uy; 0x92uy; 0x88uy; 0x88uy
-            0x01uy // reply = true, wait for finger down
+        let dacBytes = [|
+            otp.FdtDac.[0]; 0x01uy
+            otp.FdtDac.[1]; 0x01uy
+            otp.FdtDac.[2]; 0x01uy
+            otp.FdtDac.[3]; 0x01uy
         |]
-        do! this.SendAndExpectAck(Protocol.packSwitchToFdtDown fdtPayload, Protocol.CommandMcuSwitchToFdtDown)
-        let! downResp = transport.Read(64, timeout)
-        let! _ =
-            match downResp with
-            | Protocol.CommandResponse (Protocol.CommandMcuSwitchToFdtDown, _) -> Ok ()
-            | _ -> Error (ProtocolError "Failed waiting for finger down")
+        let downThresholds = [|
+            0x91uy; 0x91uy; 0x8buy; 0x8buy
+            0x96uy; 0x96uy; 0x91uy; 0x91uy
+            0x98uy; 0x98uy; 0x90uy; 0x90uy
+            0x92uy; 0x92uy; 0x88uy; 0x88uy
+        |]
+
+        // 1. Send 0x32 with reply = false
+        let fdtDownNoReply = Array.concat [| [| 0x8cuy; 0x01uy |]; dacBytes; downThresholds; [| 0x00uy |] |]
+        do! this.SendAndExpectAck(Protocol.packSwitchToFdtDown fdtDownNoReply, Protocol.CommandMcuSwitchToFdtDown)
+
+        // 2. Send 0x32 with reply = true and wait for touch event
+        let fdtDownWait = Array.concat [| [| 0x8cuy; 0x01uy |]; dacBytes; downThresholds; [| 0x01uy |] |]
+        do! this.SendAndExpectAck(Protocol.packSwitchToFdtDown fdtDownWait, Protocol.CommandMcuSwitchToFdtDown)
+        let! downPayload = this.ReadCommandResponse(Protocol.CommandMcuSwitchToFdtDown, timeout)
+
+        // 3. Extract FDT baseline up data if present in payload (offset 4..19: 16 bytes = 8 words)
+        if downPayload.Length >= 20 then
+            let fdtData = Array.sub downPayload 4 16
+            let upBase = Array.zeroCreate<byte> 16
+            for i in 0 .. 7 do
+                let w = uint16 fdtData.[2 * i] ||| (uint16 fdtData.[2 * i + 1] <<< 8)
+                let wShift = (int w) >>> 1
+                upBase.[2 * i] <- 0x80uy
+                upBase.[2 * i + 1] <- byte (wShift &&& 0xff)
+            lastFdtUpBase <- Some upBase
+
+        // 4. Immediately perform post-touch 0x36 mode switch (matching driver_53xd.py lines 242-252)
+        let fdt0dPostNoReply = Array.concat [| [| 0x0duy; 0x01uy |]; dacBytes; downThresholds; [| 0x00uy |] |]
+        do! this.SendAndExpectAck(Protocol.packSwitchToFdtMode fdt0dPostNoReply, Protocol.CommandMcuSwitchToFdtMode)
+
+        let fdt0dPostWait = Array.concat [| [| 0x0duy; 0x01uy |]; dacBytes; downThresholds; [| 0x01uy |] |]
+        let! _ = this.SendAndReceive(Protocol.packSwitchToFdtMode fdt0dPostWait, Protocol.CommandMcuSwitchToFdtMode)
+
         return ()
     }
 
@@ -414,21 +556,7 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
             otp.DacH; 0x00uy; otp.DacH - 6uy; 0x00uy
             otp.DacL; 0x00uy; otp.DacL - 4uy; 0x00uy
         |]
-        let imgReq = Protocol.packGetImage imgPayload Protocol.FlagsTransportLayerSecurityData
-        do! this.SendAndExpectAck(imgReq, Protocol.CommandMcuGetImage)
-
-        // Read encrypted application data (7684 frame payload + TLS record wrapping)
-        let! encryptedPack = transport.Read(8192, 5000)
-
-        // Decrypt application data via TLS-PSK tunnel
-        let! decrypted = tlsTunnel.DecryptApplicationData(encryptedPack)
-
-        // Verify CRC32
-        do! GoodixFrameCrc.verify (ReadOnlySpan decrypted)
-
-        // Unpack and transpose pixels into 80x64
-        let! pixels = FrameDecoder.unpackAndTranspose80x64 (Array.take FrameDecoder.PackedFrameSize decrypted)
-        return! RawFrame12Bit.create pixels
+        return! this.CaptureRawFrameInternal(imgPayload)
     }
 
     // ------------------------------------------------------------------------
@@ -437,13 +565,30 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
 
     member this.WaitForFingerUp(?timeoutMs: int) : Task<Result<unit, DriverError>> = taskResult {
         let timeout = defaultArg timeoutMs 5000
-        let mode = [| 0x01uy; 0x00uy |]
-        do! this.SendAndExpectAck(Protocol.packSwitchToFdtUp mode, Protocol.CommandMcuSwitchToFdtUp)
-        let! upResp = transport.Read(64, timeout)
-        let! _ =
-            match upResp with
-            | Protocol.CommandResponse (Protocol.CommandMcuSwitchToFdtUp, _) -> Ok ()
-            | _ -> Error (ProtocolError "Failed waiting for finger up")
+        let otp =
+            match currentOtp with
+            | Some o -> o
+            | None -> { Raw = Array.zeroCreate 64; DacH = 0x28uy; DacL = 0x24uy; FdtDac = [| 0x91uy; 0x8buy; 0x96uy; 0x91uy |] }
+
+        let dacBytes = [|
+            otp.FdtDac.[0]; 0x01uy
+            otp.FdtDac.[1]; 0x01uy
+            otp.FdtDac.[2]; 0x01uy
+            otp.FdtDac.[3]; 0x01uy
+        |]
+        let upThresholds =
+            match lastFdtUpBase with
+            | Some b when b.Length = 16 -> b
+            | _ ->
+                [|
+                    0x91uy; 0x91uy; 0x8buy; 0x8buy
+                    0x96uy; 0x96uy; 0x91uy; 0x91uy
+                    0x98uy; 0x98uy; 0x90uy; 0x90uy
+                    0x92uy; 0x92uy; 0x88uy; 0x88uy
+                |]
+        let upPayload = Array.concat [| [| 0x8cuy; 0x01uy |]; dacBytes; upThresholds; [| 0x01uy |] |]
+        do! this.SendAndExpectAck(Protocol.packSwitchToFdtUp upPayload, Protocol.CommandMcuSwitchToFdtUp)
+        let! _ = this.ReadCommandResponse(Protocol.CommandMcuSwitchToFdtUp, timeout)
         return ()
     }
 
