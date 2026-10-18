@@ -45,11 +45,18 @@ jobs:
           cp src/GoodixFp.Cli/bin/Release/net10.0/linux-x64/publish/GoodixFp.Cli src/GoodixFp.Cli/bin/Release/net10.0/linux-x64/publish/goodix-fp
           chmod +x src/GoodixFp.Cli/bin/Release/net10.0/linux-x64/publish/goodix-fp
 
-      - name: Upload Native AOT binary artifact
+      - name: Publish Native AOT fprintd Daemon binary
+        run: |
+          dotnet publish src/GoodixFp.Daemon/GoodixFp.Daemon.fsproj -c Release -r linux-x64
+          chmod +x src/GoodixFp.Daemon/bin/Release/net10.0/linux-x64/publish/goodix-fprintd
+
+      - name: Upload Native AOT binary artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: goodix-fp-linux-x64
-          path: src/GoodixFp.Cli/bin/Release/net10.0/linux-x64/publish/goodix-fp
+          name: goodix-fp-binaries-linux-x64
+          path: |
+            src/GoodixFp.Cli/bin/Release/net10.0/linux-x64/publish/goodix-fp
+            src/GoodixFp.Daemon/bin/Release/net10.0/linux-x64/publish/goodix-fprintd
           if-no-files-found: error
 
   release:
@@ -64,10 +71,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Download compiled binary artifact
+      - name: Download compiled binary artifacts
         uses: actions/download-artifact@v4
         with:
-          name: goodix-fp-linux-x64
+          name: goodix-fp-binaries-linux-x64
           path: ./dist-bin
 
       - name: Package Release Assets
@@ -77,11 +84,16 @@ jobs:
           BUNDLE_DIR="./${BUNDLE_NAME}"
           mkdir -p "${BUNDLE_DIR}"
 
-          # Place raw executable
+          # Place raw executables
           cp ./dist-bin/goodix-fp "${BUNDLE_DIR}/goodix-fp"
           chmod +x "${BUNDLE_DIR}/goodix-fp"
           cp ./dist-bin/goodix-fp ./goodix-fp
           chmod +x ./goodix-fp
+
+          cp ./dist-bin/goodix-fprintd "${BUNDLE_DIR}/goodix-fprintd"
+          chmod +x "${BUNDLE_DIR}/goodix-fprintd"
+          cp ./dist-bin/goodix-fprintd ./goodix-fprintd
+          chmod +x ./goodix-fprintd
 
           # Copy installer scripts, packaging, and docs
           cp install.sh "${BUNDLE_DIR}/"
@@ -89,18 +101,20 @@ jobs:
           cp LICENSE "${BUNDLE_DIR}/"
           cp -r scripts "${BUNDLE_DIR}/"
           cp -r packaging "${BUNDLE_DIR}/"
+          cp -r docs "${BUNDLE_DIR}/" 2>/dev/null || true
 
           # Create tarball
           tar -czvf "${BUNDLE_NAME}.tar.gz" "${BUNDLE_NAME}"
 
           # Generate SHA256 checksums
-          sha256sum goodix-fp "${BUNDLE_NAME}.tar.gz" > SHA256SUMS
+          sha256sum goodix-fp goodix-fprintd "${BUNDLE_NAME}.tar.gz" > SHA256SUMS
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             goodix-fp
+            goodix-fprintd
             goodix-fp-*-linux-x64.tar.gz
             SHA256SUMS
           generate_release_notes: true

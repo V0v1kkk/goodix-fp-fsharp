@@ -4,7 +4,7 @@ pkgver=1.0.0
 pkgrel=1
 pkgdesc="Production-grade pure F# Linux driver, matcher CLI, and fprintd bridge daemon for Goodix 53xc/53xd fingerprint sensors"
 arch=('x86_64')
-url="https://github.com/v-san/goodix-fp-fsharp"
+url="https://github.com/V0v1kkk/goodix-fp-fsharp"
 license=('MIT')
 depends=(
     'glibc'
