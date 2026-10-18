@@ -141,6 +141,7 @@ type TlsDecryptionBenchmark() =
 
     [<Benchmark>]
     member _.BouncyCastle_Decrypt7684Bytes() : int =
+        bcServer.ResetClientSeqNum()
         match (bcServer :> ITlsPskTunnel).DecryptApplicationData(encryptedPayloadForBc) with
         | Ok plain -> plain.Length
         | Error _ -> 0

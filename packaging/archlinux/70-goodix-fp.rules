@@ -1,0 +1,26 @@
+# Goodix 53xc / 53xd USB Fingerprint Sensor udev rules
+# Grants logged-in console users direct access via systemd-logind uaccess tag.
+
+# Dell XPS 13 9300 / 9310 (0x27c6:0x538d)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="27c6", ATTRS{idProduct}=="538d", MODE="0660", TAG+="uaccess"
+
+# Dell Inspiron / Vostro (0x27c6:0x530c)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="27c6", ATTRS{idProduct}=="530c", MODE="0660", TAG+="uaccess"
+
+# Dell XPS / Latitude (0x27c6:0x532d)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="27c6", ATTRS{idProduct}=="532d", MODE="0660", TAG+="uaccess"
+
+# Goodix 533c (0x27c6:0x533c)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="27c6", ATTRS{idProduct}=="533c", MODE="0660", TAG+="uaccess"
+
+# Goodix 538c (0x27c6:0x538c)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="27c6", ATTRS{idProduct}=="538c", MODE="0660", TAG+="uaccess"
+
+# Goodix 5385 (0x27c6:0x5385)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="27c6", ATTRS{idProduct}=="5385", MODE="0660", TAG+="uaccess"
+
+# Goodix 5395 (0x27c6:0x5395)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="27c6", ATTRS{idProduct}=="5395", MODE="0660", TAG+="uaccess"
+
+# Generic catch-all for Goodix 53xx series sensors
+SUBSYSTEM=="usb", ATTRS{idVendor}=="27c6", ATTRS{idProduct}=="53*", MODE="0660", TAG+="uaccess"

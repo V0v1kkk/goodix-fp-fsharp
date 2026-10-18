@@ -431,8 +431,16 @@ type GoodixTodMatcher(nativeFunctions: NativeFunctions, baselineFrame: RawFrame1
             match customPath with
             | Some p -> Ok p
             | None ->
+                let envBlob =
+                    let b = Environment.GetEnvironmentVariable("GOODIX_BLOB_PATH")
+                    if not (String.IsNullOrWhiteSpace b) then b
+                    else Environment.GetEnvironmentVariable("GOODIX_LIB_PATH")
                 let defaultPaths = [
+                    if not (String.IsNullOrWhiteSpace envBlob) then envBlob
                     Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "share", "goodix-fp", "libgoodix_tod_53xc.so")
+                    "/usr/local/lib/goodix-fp/libgoodix_tod_53xc.so"
+                    "/usr/lib/goodix-fp/libgoodix_tod_53xc.so"
+                    "/var/lib/goodix-fp/libgoodix_tod_53xc.so"
                     "/tmp/libgoodix_standalone.so"
                 ]
                 match List.tryFind File.Exists defaultPaths with

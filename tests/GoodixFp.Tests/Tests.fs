@@ -1289,5 +1289,148 @@ let ``Goodix53xdDevice WaitForFingerUpRobust detects finger lift with pure FDT m
         | Error err -> Assert.Fail($"WaitForFingerUpRobust failed: {err}")
     }
 
+// ============================================================================
+// Storage & Privilege-Separated Template Resolution Tests
+// ============================================================================
+
+[<Fact>]
+let ``Storage tryGetHomeFromPasswdFile parses passwd entries correctly`` () =
+    let tempPasswd = Path.GetTempFileName()
+    try
+        File.WriteAllLines(tempPasswd, [
+            "root:x:0:0:root:/root:/bin/bash"
+            "vladimir:x:1000:1000:Vladimir Rogozhin:/home/vladimir:/bin/zsh"
+            "service:x:999:999::/var/lib/service:/sbin/nologin"
+        ])
+
+        Assert.Equal(Some "/root", Storage.tryGetHomeFromPasswdFile tempPasswd "root")
+        Assert.Equal(Some "/home/vladimir", Storage.tryGetHomeFromPasswdFile tempPasswd "vladimir")
+        Assert.Equal(Some "/var/lib/service", Storage.tryGetHomeFromPasswdFile tempPasswd "service")
+        Assert.Equal(None, Storage.tryGetHomeFromPasswdFile tempPasswd "nonexistent")
+    finally
+        if File.Exists tempPasswd then File.Delete tempPasswd
+
+[<Fact>]
+let ``Storage resolveUserHomeWith falls back to /home/user when passwd misses`` () =
+    let mockPasswd (user: string) =
+        if user = "alice" then Some "/custom/alice" else None
+
+    let mockDirExists (path: string) =
+        path = "/custom/alice" || path = "/home/bob"
+
+    Assert.Equal(Some "/custom/alice", Storage.resolveUserHomeWith mockPasswd mockDirExists "alice")
+    Assert.Equal(Some "/home/bob", Storage.resolveUserHomeWith mockPasswd mockDirExists "bob")
+    Assert.Equal(None, Storage.resolveUserHomeWith mockPasswd mockDirExists "charlie")
+
+[<Fact>]
+let ``Storage resolveInvokingUserWith prioritizes explicit user over PAM_USER and SUDO_USER`` () =
+    let mockEnv = function
+        | "PAM_USER" -> Some "pam_alice"
+        | "SUDO_USER" -> Some "sudo_bob"
+        | _ -> None
+
+    // Explicit user takes highest priority
+    Assert.Equal(Some "target_user", Storage.resolveInvokingUserWith mockEnv (Some "target_user"))
+
+    // Falls back to PAM_USER if no explicit user
+    Assert.Equal(Some "pam_alice", Storage.resolveInvokingUserWith mockEnv None)
+
+    // Falls back to SUDO_USER if PAM_USER is absent or root
+    let mockEnvNoPam = function
+        | "PAM_USER" -> Some "root"
+        | "SUDO_USER" -> Some "sudo_bob"
+        | _ -> None
+    Assert.Equal(Some "sudo_bob", Storage.resolveInvokingUserWith mockEnvNoPam None)
+
+    // Returns None if all are root or absent
+    let mockEnvRoot = function
+        | "PAM_USER" -> Some "root"
+        | "SUDO_USER" -> Some "root"
+        | _ -> None
+    Assert.Equal(None, Storage.resolveInvokingUserWith mockEnvRoot None)
+
+[<Fact>]
+let ``Storage resolveTemplateDirectoryWith resolves XDG_DATA_HOME for regular user`` () =
+    let mockEnv = function
+        | "XDG_DATA_HOME" -> Some "/custom/xdg/share"
+        | "HOME" -> Some "/home/user"
+        | _ -> None
+    let isRoot () = false
+    let getUserHome _ = Some "/home/user"
+    let dirExists _ = true
+
+    let result = Storage.resolveTemplateDirectoryWith isRoot mockEnv getUserHome dirExists None None
+    Assert.Equal(Path.Combine("/custom/xdg/share", "goodix-fp", "templates"), result)
+
+[<Fact>]
+let ``Storage resolveTemplateDirectoryWith resolves ~/.local/share for regular user without XDG`` () =
+    let mockEnv = function
+        | "HOME" -> Some "/home/alice"
+        | _ -> None
+    let isRoot () = false
+    let getUserHome _ = Some "/home/alice"
+    let dirExists _ = true
+
+    let result = Storage.resolveTemplateDirectoryWith isRoot mockEnv getUserHome dirExists None None
+    Assert.Equal(Path.Combine("/home/alice", ".local", "share", "goodix-fp", "templates"), result)
+
+[<Fact>]
+let ``Storage resolveTemplateDirectoryWith resolves user home when run as root via sudo or PAM`` () =
+    let mockEnv = function
+        | "SUDO_USER" -> Some "vladimir"
+        | _ -> None
+    let isRoot () = true
+    let getUserHome (u: string) = if u = "vladimir" then Some "/home/vladimir" else None
+    let dirExists (p: string) = p = Path.Combine("/home/vladimir", ".local", "share", "goodix-fp", "templates")
+
+    let result = Storage.resolveTemplateDirectoryWith isRoot mockEnv getUserHome dirExists None None
+    Assert.Equal(Path.Combine("/home/vladimir", ".local", "share", "goodix-fp", "templates"), result)
+
+[<Fact>]
+let ``Storage resolveTemplateDirectoryWith falls back to system dirs when root has no user templates`` () =
+    let mockEnv = function
+        | "PAM_USER" -> Some "bob"
+        | _ -> None
+    let isRoot () = true
+    let getUserHome (u: string) = if u = "bob" then Some "/home/bob" else None
+    // Bob's templates don't exist yet, but /var/lib/goodix-fp/templates exists
+    let dirExists (p: string) = p = "/var/lib/goodix-fp/templates"
+
+    let result = Storage.resolveTemplateDirectoryWith isRoot mockEnv getUserHome dirExists None None
+    Assert.Equal("/var/lib/goodix-fp/templates", result)
+
+[<Fact>]
+let ``Storage resolveTemplateDirectoryWith falls back to /etc when /var/lib missing`` () =
+    let mockEnv = function
+        | "PAM_USER" -> Some "bob"
+        | _ -> None
+    let isRoot () = true
+    let getUserHome (u: string) = if u = "bob" then Some "/home/bob" else None
+    let dirExists (p: string) = p = "/etc/goodix-fp/templates"
+
+    let result = Storage.resolveTemplateDirectoryWith isRoot mockEnv getUserHome dirExists None None
+    Assert.Equal("/etc/goodix-fp/templates", result)
+
+[<Fact>]
+let ``Storage resolveTemplateDirectoryWith falls back to system dir for direct root run`` () =
+    let mockEnv _ = None
+    let isRoot () = true
+    let getUserHome _ = None
+    let dirExists (p: string) = p = "/var/lib/goodix-fp/templates"
+
+    let result = Storage.resolveTemplateDirectoryWith isRoot mockEnv getUserHome dirExists None None
+    Assert.Equal("/var/lib/goodix-fp/templates", result)
+
+[<Fact>]
+let ``Storage resolveTemplateDirectoryWith respects explicit customDir override`` () =
+    let mockEnv _ = Some "/ignored"
+    let isRoot () = true
+    let getUserHome _ = Some "/ignored"
+    let dirExists _ = true
+
+    let result = Storage.resolveTemplateDirectoryWith isRoot mockEnv getUserHome dirExists (Some "/custom/override/dir") None
+    Assert.Equal("/custom/override/dir", result)
+
+
 
 

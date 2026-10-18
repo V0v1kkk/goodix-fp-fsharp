@@ -1,0 +1,69 @@
+# Maintainer: Vladimir <vladimir@example.com>
+pkgname=goodix-fp
+pkgver=1.0.0
+pkgrel=1
+pkgdesc="Production-grade pure F# Linux driver and matcher CLI for Goodix 53xc/53xd fingerprint sensors"
+arch=('x86_64')
+url="https://github.com/v-san/goodix-fp-fsharp"
+license=('MIT')
+depends=(
+    'glibc'
+    'libusb'
+)
+makedepends=(
+    'dotnet-sdk>=10.0'
+)
+optdepends=(
+    'pam: PAM authentication support'
+    'python: Dell OEM blob extraction and patching script'
+)
+options=(!strip)
+source=(
+    '70-goodix-fp.rules'
+)
+sha256sums=(
+    '49cb269d28077e41b9dc0b79095b11b0dd4294682d31e137e05e77226eac0e00'
+)
+
+_get_repo_root() {
+    if [[ -f "${startdir}/../../GoodixFp.sln" ]]; then
+        (cd "${startdir}/../.." && pwd)
+    elif [[ -d "${srcdir}/${pkgname}" ]]; then
+        echo "${srcdir}/${pkgname}"
+    else
+        pwd
+    fi
+}
+
+build() {
+    local repo_root
+    repo_root="$(_get_repo_root)"
+
+    cd "${repo_root}"
+    echo "==> Building GoodixFp.Cli Native AOT binary..."
+    # Prevent makepkg flags from conflicting with .NET ILCompiler Native AOT toolchain
+    unset CFLAGS CXXFLAGS LDFLAGS
+
+    dotnet publish src/GoodixFp.Cli/GoodixFp.Cli.fsproj \
+        -c Release \
+        -r linux-x64 \
+        --self-contained \
+        -o "${srcdir}/publish"
+}
+
+package() {
+    local repo_root
+    repo_root="$(_get_repo_root)"
+
+    # 1. Install Native AOT binary as /usr/bin/goodix-fp
+    install -Dm755 "${srcdir}/publish/GoodixFp.Cli" "${pkgdir}/usr/bin/goodix-fp"
+
+    # 2. Install udev rules to /usr/lib/udev/rules.d/70-goodix-fp.rules
+    install -Dm644 "${srcdir}/70-goodix-fp.rules" "${pkgdir}/usr/lib/udev/rules.d/70-goodix-fp.rules"
+
+    # 3. Install license
+    install -Dm644 "${repo_root}/LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+
+    # 4. Install documentation
+    install -Dm644 "${repo_root}/README.md" "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+}

@@ -395,12 +395,31 @@ type BouncyCastleTlsPskTunnel(psk: byte[]) =
 
     do initServer ()
 
+    let mutable cachedSeqObj: obj = null
+    let mutable cachedValField: System.Reflection.FieldInfo = null
+
     new() = new BouncyCastleTlsPskTunnel(Array.zeroCreate 32)
 
     member this.ResetInternal() =
+        cachedSeqObj <- null
+        cachedValField <- null
         if not (isNull serverProtocol) then
             try serverProtocol.Close() with _ -> ()
         initServer ()
+
+    member this.ResetClientSeqNum(?seqNum: uint64) =
+        let target = int64 (defaultArg seqNum 1UL)
+        if isNull cachedValField && not (isNull serverProtocol) then
+            try
+                let flags = System.Reflection.BindingFlags.Instance ||| System.Reflection.BindingFlags.NonPublic
+                let rsField = typeof<TlsProtocol>.GetField("m_recordStream", flags)
+                let rs = rsField.GetValue(serverProtocol)
+                let seqField = rs.GetType().GetField("m_readSeqNo", flags)
+                cachedSeqObj <- seqField.GetValue(rs)
+                cachedValField <- cachedSeqObj.GetType().GetField("m_value", flags)
+            with _ -> ()
+        if not (isNull cachedValField) && not (isNull cachedSeqObj) then
+            cachedValField.SetValue(cachedSeqObj, target)
 
     interface ITlsPskTunnel with
         member this.IsHandshakeComplete =

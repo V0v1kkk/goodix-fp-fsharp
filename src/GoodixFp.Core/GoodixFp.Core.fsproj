@@ -15,6 +15,7 @@
     <Compile Include="TlsPsk.fs" />
     <Compile Include="LibUsb.fs" />
     <Compile Include="Device53xd.fs" />
+    <Compile Include="Storage.fs" />
   </ItemGroup>
 
   <ItemGroup>

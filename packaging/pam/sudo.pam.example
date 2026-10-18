@@ -1,0 +1,44 @@
+#%PAM-1.0
+# =============================================================================
+# Goodix 27c6:538d Fingerprint PAM Configuration for sudo
+# =============================================================================
+#
+# Instructions:
+# 1. Install the wrapper script to /usr/local/bin/goodix-fp-pam:
+#      sudo install -m 0755 packaging/pam/pam_goodix.sh /usr/local/bin/goodix-fp-pam
+#
+# 2. Add the 'auth sufficient' line at the TOP of the auth stack in /etc/pam.d/sudo.
+#    Because it is marked 'sufficient':
+#    - If fingerprint matches -> Authentication succeeds immediately.
+#    - If fingerprint fails, times out, or user has no enrolled templates ->
+#      PAM continues down the stack to prompt for standard user password.
+#
+# 3. Always test with a separate root terminal open before logging out!
+#
+# =============================================================================
+# Arch Linux Example (/etc/pam.d/sudo):
+# =============================================================================
+auth        sufficient    pam_exec.so stdout /usr/local/bin/goodix-fp-pam
+auth        include       system-auth
+account     include       system-auth
+session     include       system-auth
+session     optional      pam_systemd.so class=none
+
+# =============================================================================
+# Debian / Ubuntu Example (/etc/pam.d/sudo):
+# =============================================================================
+# auth      sufficient    pam_exec.so stdout /usr/local/bin/goodix-fp-pam
+# @include common-auth
+# @include common-account
+# @include common-session-noninteractive
+
+# =============================================================================
+# Fedora / RHEL Example (/etc/pam.d/sudo):
+# =============================================================================
+# auth      sufficient    pam_exec.so stdout /usr/local/bin/goodix-fp-pam
+# auth      include       system-auth
+# account   include       system-auth
+# password  include       system-auth
+# session   optional      pam_keyinit.so revoke
+# session   required      pam_limits.so
+# session   include       system-auth

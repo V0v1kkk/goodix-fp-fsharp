@@ -11,52 +11,40 @@ open GoodixFp.NativeMatcher
 
 module Storage =
 
-    let getTemplateDirectory () : string =
-        let xdg = Environment.GetEnvironmentVariable("XDG_DATA_HOME")
-        let baseDir =
-            if not (String.IsNullOrWhiteSpace xdg) then xdg
-            else Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "share")
-        let tmplDir = Path.Combine(baseDir, "goodix-fp", "templates")
-        if not (Directory.Exists tmplDir) then
-            Directory.CreateDirectory(tmplDir) |> ignore
-        tmplDir
+    let resolveTemplateDirectoryWith = GoodixFp.Core.Storage.resolveTemplateDirectoryWith
+    let resolveUserHome = GoodixFp.Core.Storage.resolveUserHome
+    let resolveInvokingUser = GoodixFp.Core.Storage.resolveInvokingUser
+    let ensureDirectoryExists = GoodixFp.Core.Storage.ensureDirectoryExists
 
-    let getFirmwarePath () : string =
-        let xdg = Environment.GetEnvironmentVariable("XDG_DATA_HOME")
-        let primaryPath =
-            let baseDir =
-                if not (String.IsNullOrWhiteSpace xdg) then xdg
-                else Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "share")
-            Path.Combine(baseDir, "goodix-fp", "GF5298_GM168SEC_APP_13016.bin")
-        if File.Exists primaryPath then primaryPath
-        elif File.Exists "/home/vladimir/.local/share/goodix-fp/GF5298_GM168SEC_APP_13016.bin" then
-            "/home/vladimir/.local/share/goodix-fp/GF5298_GM168SEC_APP_13016.bin"
-        else primaryPath
+    let getTemplateDirectory (customDir: string option) (targetUser: string option) : string =
+        GoodixFp.Core.Storage.getTemplateDirectory customDir targetUser
 
-    let loadAllTemplates () : (FingerId * TemplateBlob) list =
-        let dir = getTemplateDirectory ()
-        if not (Directory.Exists dir) then []
-        else
-            Directory.GetFiles(dir, "*.tgla")
-            |> Array.choose (fun file ->
-                try
-                    let fingerName = Path.GetFileNameWithoutExtension(file)
-                    let bytes = File.ReadAllBytes(file)
-                    match FingerId.create fingerName, TemplateBlob.create bytes with
-                    | Ok fid, Ok blob -> Some (fid, blob)
-                    | _ -> None
-                with _ -> None
-            )
-            |> Array.toList
+    let getTemplateDirectories (customDir: string option) (targetUser: string option) : string list =
+        GoodixFp.Core.Storage.getTemplateDirectories customDir targetUser
+
+    let getFirmwarePath (targetUser: string option) : string =
+        GoodixFp.Core.Storage.getFirmwarePath targetUser
+
+    let loadAllTemplates (customDir: string option) (targetUser: string option) : (FingerId * TemplateBlob) list =
+        GoodixFp.Core.Storage.loadAllRawTemplates customDir targetUser
+        |> List.choose (fun (fingerName, bytes) ->
+            match FingerId.create fingerName, TemplateBlob.create bytes with
+            | Ok fid, Ok blob -> Some (fid, blob)
+            | _ -> None
+        )
 
 type CliOptions = {
     Command: string
     FingerName: string option
     Prefix: string option
     Seconds: int option
+    Retries: int
     UseBouncyCastle: bool
     Vid: uint16
     Pid: uint16
+    Quiet: bool
+    TemplateDir: string option
+    TargetUser: string option
 }
 
 module CommandLine =
@@ -66,10 +54,19 @@ module CommandLine =
         FingerName = None
         Prefix = None
         Seconds = None
+        Retries = 3
         UseBouncyCastle = false
         Vid = 0x27c6us
         Pid = 0x538dus
+        Quiet = false
+        TemplateDir = None
+        TargetUser = None
     }
+
+    let (|PositiveInt|_|) (s: string) =
+        match Int32.TryParse s with
+        | true, n when n > 0 -> Some n
+        | _ -> None
 
     let rec parseArgs (args: string list) (opts: CliOptions) : Result<CliOptions, string> =
         match args with
@@ -100,8 +97,12 @@ module CommandLine =
             parseOptions rest { opts with Command = "enroll"; FingerName = Some name }
         | "enroll" :: _ ->
             Error "The 'enroll' command requires a finger name, e.g. 'goodix-fp enroll index_right'"
+        | "verify" :: user :: rest when not (user.StartsWith("-")) ->
+            parseOptions rest { opts with Command = "verify"; TargetUser = Some user }
         | "verify" :: rest ->
             parseOptions rest { opts with Command = "verify" }
+        | "setup-udev" :: rest ->
+            parseOptions rest { opts with Command = "setup-udev" }
         | "fdt-monitor" :: secStr :: rest when not (secStr.StartsWith("-")) ->
             let sec = match Int32.TryParse secStr with true, s when s > 0 -> s | _ -> 10
             parseOptions rest { opts with Command = "fdt-monitor"; Seconds = Some sec }
@@ -131,6 +132,22 @@ module CommandLine =
             parseOptions rest { opts with UseBouncyCastle = false }
         | "--tls" :: other :: _ ->
             Error $"Invalid TLS engine '{other}'. Expected 'pure' or 'bc'."
+        | "--retries" :: [] ->
+            Error "The '--retries' option requires an integer argument."
+        | "--retries" :: PositiveInt n :: rest ->
+            parseOptions rest { opts with Retries = n }
+        | "--retries" :: nStr :: _ ->
+            Error $"Invalid retries count '{nStr}'. Expected a positive integer."
+        | "--quiet" :: rest | "-q" :: rest ->
+            parseOptions rest { opts with Quiet = true }
+        | "--user" :: [] ->
+            Error "The '--user' option requires a username argument."
+        | "--user" :: user :: rest ->
+            parseOptions rest { opts with TargetUser = Some user }
+        | "--template-dir" :: [] ->
+            Error "The '--template-dir' option requires a directory path argument."
+        | "--template-dir" :: dir :: rest ->
+            parseOptions rest { opts with TemplateDir = Some dir }
         | "--vid" :: hexStr :: rest ->
             try
                 let v = Convert.ToUInt16(hexStr, 16)
@@ -162,7 +179,8 @@ module DeviceRunner =
     let withDevice (opts: CliOptions) (action: Goodix53xdDevice -> Task<int>) : Task<int> = task {
         match openDevice opts with
         | Error err ->
-            eprintfn $"[!] Failed to open device: {err}"
+            if not opts.Quiet then
+                eprintfn $"[!] Failed to open device: {err}"
             return 1
         | Ok dev ->
             let devDisp = dev :> IDisposable
@@ -172,10 +190,11 @@ module DeviceRunner =
                 devDisp.Dispose()
     }
 
-    let withMatcher (baseline: RawFrame12Bit option) (action: GoodixTodMatcher -> Task<int>) : Task<int> = task {
+    let withMatcherWithQuiet (baseline: RawFrame12Bit option) (quiet: bool) (action: GoodixTodMatcher -> Task<int>) : Task<int> = task {
         match GoodixTodMatcher.Create(?baseline = baseline) with
         | Error err ->
-            eprintfn $"[!] Failed to initialize Goodix TOD matcher: {err}"
+            if not quiet then
+                eprintfn $"[!] Failed to initialize Goodix TOD matcher: {err}"
             return 1
         | Ok matcher ->
             let matchDisp = matcher :> IDisposable
@@ -184,6 +203,9 @@ module DeviceRunner =
             finally
                 matchDisp.Dispose()
     }
+
+    let withMatcher (baseline: RawFrame12Bit option) (action: GoodixTodMatcher -> Task<int>) : Task<int> =
+        withMatcherWithQuiet baseline false action
 
     let runProbe (opts: CliOptions) : Task<int> =
         printfn $"[*] Probing Goodix 53xd device (VID: 0x{opts.Vid:X4}, PID: 0x{opts.Pid:X4})..."
@@ -262,7 +284,7 @@ module DeviceRunner =
 
 
     let runProvisionPsk (opts: CliOptions) : Task<int> =
-        let fwPath = Storage.getFirmwarePath ()
+        let fwPath = Storage.getFirmwarePath opts.TargetUser
         printfn $"[*] Loading firmware image from: {fwPath}"
         if not (File.Exists fwPath) then
             eprintfn $"[!] Firmware file not found: {fwPath}"
@@ -472,7 +494,8 @@ module DeviceRunner =
                                 eprintfn $"[!] Failed to commit template: {err}"
                                 return 1
                             | Ok templateBlob ->
-                                let tmplDir = Storage.getTemplateDirectory ()
+                                let tmplDir = Storage.getTemplateDirectory opts.TemplateDir opts.TargetUser
+                                Storage.ensureDirectoryExists tmplDir
                                 let tmplPath = Path.Combine(tmplDir, $"{fingerName}.tgla")
                                 File.WriteAllBytes(tmplPath, templateBlob.Value)
                                 printfn $"[+] Template committed ({templateBlob.Length} bytes) with 'TGLA' header."
@@ -482,51 +505,81 @@ module DeviceRunner =
         })
 
     let runVerify (opts: CliOptions) : Task<int> =
-        let templates = Storage.loadAllTemplates ()
+        let templates = Storage.loadAllTemplates opts.TemplateDir opts.TargetUser
         if List.isEmpty templates then
-            eprintfn $"[!] No enrolled templates found in: {Storage.getTemplateDirectory ()}"
-            eprintfn "    Please enroll a finger first using: goodix-fp enroll <finger-name>"
+            if not opts.Quiet then
+                let tmplDir = Storage.getTemplateDirectory opts.TemplateDir opts.TargetUser
+                eprintfn $"[!] No enrolled templates found in: {tmplDir}"
+                eprintfn "    Please enroll a finger first using: goodix-fp enroll <finger-name>"
             Task.FromResult 1
         else
-            printfn $"[*] Loaded {templates.Length} enrolled template(s). Connecting to device..."
+            let maxRetries = max 1 opts.Retries
+            if not opts.Quiet then
+                let userDesc =
+                    match Storage.resolveInvokingUser opts.TargetUser with
+                    | Some u -> $" for user '{u}'"
+                    | None -> ""
+                printfn $"[*] Loaded {templates.Length} enrolled template(s){userDesc}. Connecting to device..."
             withDevice opts (fun dev -> task {
                 let! actRes = dev.ActivateSession()
                 match actRes with
                 | Error err ->
-                    eprintfn $"[!] Session activation failed: {err}"
+                    if not opts.Quiet then
+                        eprintfn $"[!] Session activation failed: {err}"
                     return 1
                 | Ok _ ->
-                    printfn "[*] Touch sensor to verify..."
-                    Console.Out.Flush()
-                    let! downRes = dev.WaitForFingerDown(timeoutMs = 15000)
-                    match downRes with
-                    | Error _ ->
-                        eprintfn "[!] Verification timed out waiting for touch."
-                        return 1
-                    | Ok () ->
-                        printfn "[*] Finger detected. Capturing probe..."
-                        Console.Out.Flush()
-                        let! capRes = dev.CaptureFrame()
-                        match capRes with
-                        | Error err ->
-                            eprintfn $"[!] Frame capture failed: {err}"
-                            return 1
-                        | Ok frame ->
-                            let! _ = dev.WaitForFingerUpRobust(timeoutMs = 10000)
-                            let! _ = dev.Sleep()
+                    return! withMatcherWithQuiet dev.BaselineFrame opts.Quiet (fun matcher -> task {
+                        if not opts.Quiet then
+                            printfn "[*] Touch sensor to verify..."
+                            Console.Out.Flush()
 
-                            return! withMatcher dev.BaselineFrame (fun matcher -> task {
-                                match matcher.IdentifyProbe(frame.Pixels, templates) with
+                        let rec verifyLoop (attempt: int) : Task<int> = task {
+                            let! downRes = dev.WaitForFingerDown(timeoutMs = 15000)
+                            match downRes with
+                            | Error _ ->
+                                if not opts.Quiet then
+                                    eprintfn "[!] Verification timed out waiting for touch."
+                                let! _ = dev.Sleep()
+                                return 1
+                            | Ok () ->
+                                if not opts.Quiet then
+                                    printfn "[*] Finger detected. Capturing probe..."
+                                    Console.Out.Flush()
+                                let! capRes = dev.CaptureFrame()
+                                match capRes with
                                 | Error err ->
-                                    eprintfn $"[!] Identification failed: {err}"
+                                    if not opts.Quiet then
+                                        eprintfn $"[!] Frame capture failed: {err}"
+                                    let! _ = dev.Sleep()
                                     return 1
-                                | Ok (Some matchedFid) ->
-                                    printfn $"[+] MATCH VERIFIED: {matchedFid.Value}"
-                                    return 0 // Exit code 0 for PAM success
-                                | Ok None ->
-                                    printfn "[-] NO MATCH (Access Denied)"
-                                    return 1 // Exit code 1 for PAM failure
-                            })
+                                | Ok frame ->
+                                    match matcher.IdentifyProbe(frame.Pixels, templates) with
+                                    | Error err ->
+                                        if not opts.Quiet then
+                                            eprintfn $"[!] Identification failed: {err}"
+                                        let! _ = dev.Sleep()
+                                        return 1
+                                    | Ok (Some matchedFid) ->
+                                        if not opts.Quiet then
+                                            printfn $"[+] MATCH VERIFIED: {matchedFid.Value}"
+                                        let! _ = dev.Sleep()
+                                        return 0 // Exit code 0 for PAM success
+                                    | Ok None ->
+                                        if attempt < maxRetries then
+                                            if not opts.Quiet then
+                                                printfn $"[-] Touch not recognized (attempt {attempt}/{maxRetries}). Please place finger firmly on sensor again..."
+                                                Console.Out.Flush()
+                                            let! _ = dev.WaitForFingerUpRobust(timeoutMs = 10000)
+                                            return! verifyLoop (attempt + 1)
+                                        else
+                                            if not opts.Quiet then
+                                                printfn $"[-] Verification failed: no matching finger after {maxRetries} attempts (Access Denied)"
+                                            let! _ = dev.Sleep()
+                                            return 1 // Exit code 1 for PAM failure
+                        }
+
+                        return! verifyLoop 1
+                    })
             })
 
     let runBenchmarkSync () : int =
@@ -668,7 +721,54 @@ module DeviceRunner =
         let usDec = float swDec.ElapsedTicks * 1_000_000.0 / float Stopwatch.Frequency / 5000.0
         let fpsDec = 5000.0 / swDec.Elapsed.TotalSeconds
         let mbsDec = (float (5000L * 7684L) / (1024.0 * 1024.0)) / swDec.Elapsed.TotalSeconds
-        printfn $"  Pure F# Decrypt       : {usDec,7:F1} us/frame | {mbsDec,7:F1} MB/s | {fpsDec,7:F1} frames/sec\n"
+        printfn $"  Pure F# Decrypt       : {usDec,7:F1} us/frame | {mbsDec,7:F1} MB/s | {fpsDec,7:F1} frames/sec"
+
+        // Setup BouncyCastle decryption
+        let bcDecClient = new TlsClientProtocol()
+        bcDecClient.Connect(TestPskTlsClient(psk))
+        use bcDecServer = new BouncyCastleTlsPskTunnel(psk)
+        let pumpBc () =
+            let cAvail = bcDecClient.GetAvailableOutputBytes()
+            if cAvail > 0 then
+                let cBuf = Array.zeroCreate<byte> cAvail
+                bcDecClient.ReadOutput(cBuf, 0, cAvail) |> ignore
+                match (bcDecServer :> ITlsPskTunnel).HandleHandshake(cBuf) with
+                | Ok (Some sResp) -> bcDecClient.OfferInput(sResp)
+                | _ -> ()
+        let mutable bcIters = 0
+        while (not bcDecClient.IsConnected || not (bcDecServer :> ITlsPskTunnel).IsHandshakeComplete) && bcIters < 10 do
+            pumpBc ()
+            bcIters <- bcIters + 1
+
+        bcDecClient.WriteApplicationData(frame7684, 0, frame7684.Length)
+        let bcAppDecLen = bcDecClient.GetAvailableOutputBytes()
+        let bcAppDecBuf = Array.zeroCreate<byte> bcAppDecLen
+        bcDecClient.ReadOutput(bcAppDecBuf, 0, bcAppDecLen) |> ignore
+
+        let encryptedPayloadForBc = Array.concat [
+            [| 0xb2uy; 0x00uy; 0x20uy; 0xd2uy; 0x00uy; 0x00uy; 0x00uy; 0x00uy; 0x00uy |]
+            bcAppDecBuf
+        ]
+
+        // Warmup BC
+        for _ in 1 .. 50 do
+            bcDecServer.ResetClientSeqNum()
+            (bcDecServer :> ITlsPskTunnel).DecryptApplicationData(encryptedPayloadForBc) |> ignore
+
+        let swBcDec = Stopwatch.StartNew()
+        for _ in 1 .. 5000 do
+            bcDecServer.ResetClientSeqNum()
+            match (bcDecServer :> ITlsPskTunnel).DecryptApplicationData(encryptedPayloadForBc) with
+            | Ok _ -> ()
+            | Error err -> failwith $"BC Decryption failed: {err}"
+        swBcDec.Stop()
+
+        let usBcDec = float swBcDec.ElapsedTicks * 1_000_000.0 / float Stopwatch.Frequency / 5000.0
+        let fpsBcDec = 5000.0 / swBcDec.Elapsed.TotalSeconds
+        let mbsBcDec = (float (5000L * 7684L) / (1024.0 * 1024.0)) / swBcDec.Elapsed.TotalSeconds
+        let speedupDec = usBcDec / usDec
+        printfn $"  BouncyCastle Decrypt  : {usBcDec,7:F1} us/frame | {mbsBcDec,7:F1} MB/s | {fpsBcDec,7:F1} frames/sec"
+        printfn $"  Speedup (Pure vs BC)  : {speedupDec:F2}x faster\n"
 
         // --------------------------------------------------------------------
         // [3/5] FrameDecoder 80x64 Unpack & Transpose (20,000 iterations)
@@ -950,6 +1050,43 @@ module DeviceRunner =
                         return 1
         })
 
+    let runSetupUdev () : Task<int> = task {
+        printfn "[*] Goodix 27c6:538d udev rule installer"
+        let ruleContent =
+            "# Goodix Fingerprint Sensor 27c6:538d (Dell Vostro 7590 / Inspiron)\n" +
+            "SUBSYSTEM==\"usb\", ATTRS{idVendor}==\"27c6\", ATTRS{idProduct}==\"538d\", MODE=\"0660\", TAG+=\"uaccess\", GROUP=\"plugdev\"\n"
+        let destPath = "/etc/udev/rules.d/70-goodix-fp.rules"
+
+        try
+            File.WriteAllText(destPath, ruleContent)
+            printfn $"[+] Installed rules to {destPath}"
+            let p1 = Process.Start("udevadm", "control --reload-rules")
+            p1.WaitForExit()
+            let p2 = Process.Start("udevadm", "trigger --subsystem-match=usb --attr-match=idVendor=27c6 --attr-match=idProduct=538d")
+            p2.WaitForExit()
+            printfn "[+] udev rules reloaded and triggered successfully."
+            return 0
+        with _ ->
+            printfn "[*] Direct write failed, invoking sudo..."
+            let psi = ProcessStartInfo()
+            psi.FileName <- "sudo"
+            psi.Arguments <- $"sh -c 'echo \"{ruleContent.Trim()}\" > {destPath} && udevadm control --reload-rules && udevadm trigger'"
+            psi.UseShellExecute <- false
+            try
+                let proc = Process.Start(psi)
+                proc.WaitForExit()
+                if proc.ExitCode = 0 then
+                    printfn $"[+] Successfully installed udev rules via sudo."
+                    return 0
+                else
+                    eprintfn $"[!] Failed to install udev rules (exit code {proc.ExitCode}). Run scripts/setup-udev.sh with sudo."
+                    return proc.ExitCode
+            with ex ->
+                eprintfn $"[!] Could not elevate privileges: {ex.Message}"
+                eprintfn $"    Please run: sudo scripts/setup-udev.sh"
+                return 1
+    }
+
 module Program =
 
     let printHelp () =
@@ -963,19 +1100,26 @@ module Program =
         printfn "  calibrate [prefix]        Capture baseline calibration frame (no touch)"
         printfn "  capture [prefix]          Capture baseline & frame, export PGM images"
         printfn "  enroll <finger-name>      12-touch interactive enrollment loop"
-        printfn "  verify                    Verify finger against enrolled templates (PAM)"
+        printfn "  verify [user] [options]   Verify finger against enrolled templates (PAM)"
+        printfn "  setup-udev                Install udev rules to /etc/udev/rules.d/ and reload"
         printfn "  fdt-monitor [sec]         Monitor live FDT 8-channel readings and delta (default: 10s)"
         printfn "  fdt-up-test               Test WaitForFingerUpRobust response time with no finger"
         printfn "  benchmark                 Run Native AOT performance benchmark suite"
         printfn "  test-merge <raw> [calib]  Test offline preprocessing & sample merging"
         printfn "  help                      Show this help message\n"
         printfn "Options:"
+        printfn "  --user <username>         Target user for enrolled templates (PAM/sudo)"
+        printfn "  --quiet, -q               Quiet mode (minimal output, ideal for PAM)"
+        printfn "  --template-dir <path>     Directory containing enrolled .tgla templates"
+        printfn "  --retries <N>             Max verification attempts before failure (default: 3)"
         printfn "  --calibrate-only          Run calibration capture only"
         printfn "  --tls <pure|bc>           TLS PSK engine (default: pure)"
         printfn "  --vid <hex>               USB Vendor ID (default: 27c6)"
         printfn "  --pid <hex>               USB Product ID (default: 538d)\n"
-        printfn "Templates directory:"
-        printfn "  ${XDG_DATA_HOME:-$HOME/.local/share}/goodix-fp/templates/\n"
+        printfn "Templates directory resolution:"
+        printfn "  Regular user: ${XDG_DATA_HOME:-$HOME/.local/share}/goodix-fp/templates/"
+        printfn "  PAM / sudo:   ~<invoking-user>/.local/share/goodix-fp/templates/"
+        printfn "  System:       /var/lib/goodix-fp/templates/ or /etc/goodix-fp/templates/\n"
 
     [<EntryPoint>]
     let main (argv: string[]) : int =
@@ -1005,6 +1149,8 @@ module Program =
                 (DeviceRunner.runEnroll opts name).GetAwaiter().GetResult()
             | "verify" ->
                 (DeviceRunner.runVerify opts).GetAwaiter().GetResult()
+            | "setup-udev" ->
+                (DeviceRunner.runSetupUdev ()).GetAwaiter().GetResult()
             | "fdt-monitor" ->
                 (DeviceRunner.runFdtMonitor opts).GetAwaiter().GetResult()
             | "fdt-up-test" ->

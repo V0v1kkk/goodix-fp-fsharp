@@ -1,0 +1,43 @@
+#%PAM-1.0
+# =============================================================================
+# Goodix 27c6:538d Fingerprint PAM Configuration for Local Login & Lock Screens
+# =============================================================================
+#
+# This configuration enables fingerprint authentication for:
+#   - Local virtual console login (/etc/pam.d/system-local-login)
+#   - Screen lockers (hyprlock, swaylock, vlock, etc.)
+#   - Display managers (greetd, sddm, etc.)
+#
+# How it works:
+#   When logging in or unlocking the screen, the system first checks the fingerprint reader.
+#   - Touching the sensor with an enrolled finger unlocks immediately.
+#   - If no finger is presented within the timeout, or if verification fails,
+#     it seamlessly prompts for the user's password.
+#
+# =============================================================================
+# /etc/pam.d/system-local-login (Arch Linux):
+# =============================================================================
+auth      sufficient    pam_exec.so stdout /usr/local/bin/goodix-fp-pam
+auth      include       system-login
+account   include       system-login
+password  include       system-login
+session   include       system-login
+
+# =============================================================================
+# Screen Locker Examples (Swaylock / Hyprlock):
+# =============================================================================
+# For swaylock (/etc/pam.d/swaylock) or hyprlock (/etc/pam.d/hyprlock):
+#
+# auth      sufficient    pam_exec.so stdout /usr/local/bin/goodix-fp-pam
+# auth      include       system-auth
+# account   include       system-auth
+# session   include       system-auth
+
+# =============================================================================
+# Display Manager Examples (Greetd / SDDM):
+# =============================================================================
+# For greetd (/etc/pam.d/greetd):
+# auth      sufficient    pam_exec.so stdout /usr/local/bin/goodix-fp-pam
+# auth      include       system-login
+# account   include       system-login
+# session   include       system-login
