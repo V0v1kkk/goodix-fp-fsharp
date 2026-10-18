@@ -1,10 +1,15 @@
-name: CI
+name: CI/CD
 
 on:
   push:
     branches: [ main ]
+    tags: [ 'v*' ]
   pull_request:
     branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build-and-test:
@@ -35,11 +40,67 @@ jobs:
         run: dotnet test GoodixFp.sln --configuration Release --no-build --verbosity normal
 
       - name: Publish Native AOT CLI binary
-        run: dotnet publish src/GoodixFp.Cli/GoodixFp.Cli.fsproj -c Release -r linux-x64
+        run: |
+          dotnet publish src/GoodixFp.Cli/GoodixFp.Cli.fsproj -c Release -r linux-x64
+          cp src/GoodixFp.Cli/bin/Release/net10.0/linux-x64/publish/GoodixFp.Cli src/GoodixFp.Cli/bin/Release/net10.0/linux-x64/publish/goodix-fp
+          chmod +x src/GoodixFp.Cli/bin/Release/net10.0/linux-x64/publish/goodix-fp
 
       - name: Upload Native AOT binary artifact
         uses: actions/upload-artifact@v4
         with:
           name: goodix-fp-linux-x64
-          path: src/GoodixFp.Cli/bin/Release/net10.0/linux-x64/publish/GoodixFp.Cli
+          path: src/GoodixFp.Cli/bin/Release/net10.0/linux-x64/publish/goodix-fp
           if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: build-and-test
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download compiled binary artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: goodix-fp-linux-x64
+          path: ./dist-bin
+
+      - name: Package Release Assets
+        run: |
+          VERSION="${GITHUB_REF_NAME:-latest}"
+          BUNDLE_NAME="goodix-fp-${VERSION}-linux-x64"
+          BUNDLE_DIR="./${BUNDLE_NAME}"
+          mkdir -p "${BUNDLE_DIR}"
+
+          # Place raw executable
+          cp ./dist-bin/goodix-fp "${BUNDLE_DIR}/goodix-fp"
+          chmod +x "${BUNDLE_DIR}/goodix-fp"
+          cp ./dist-bin/goodix-fp ./goodix-fp
+          chmod +x ./goodix-fp
+
+          # Copy installer scripts, packaging, and docs
+          cp install.sh "${BUNDLE_DIR}/"
+          cp README.md "${BUNDLE_DIR}/"
+          cp LICENSE "${BUNDLE_DIR}/"
+          cp -r scripts "${BUNDLE_DIR}/"
+          cp -r packaging "${BUNDLE_DIR}/"
+
+          # Create tarball
+          tar -czvf "${BUNDLE_NAME}.tar.gz" "${BUNDLE_NAME}"
+
+          # Generate SHA256 checksums
+          sha256sum goodix-fp "${BUNDLE_NAME}.tar.gz" > SHA256SUMS
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            goodix-fp
+            goodix-fp-*-linux-x64.tar.gz
+            SHA256SUMS
+          generate_release_notes: true

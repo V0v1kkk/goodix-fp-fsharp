@@ -61,11 +61,13 @@ fi
 echo "[+] libusb-1.0 dependency found."
 
 # 3. Locate or build Native AOT binary
-BIN_SRC="${SCRIPT_DIR}/src/GoodixFp.Cli/bin/Release/net10.0/linux-x64/publish/GoodixFp.Cli"
+BIN_SRC="${SCRIPT_DIR}/goodix-fp"
+if [[ ! -f "${BIN_SRC}" ]]; then
+    BIN_SRC="${SCRIPT_DIR}/src/GoodixFp.Cli/bin/Release/net10.0/linux-x64/publish/GoodixFp.Cli"
+fi
 
 if [[ ! -f "${BIN_SRC}" ]]; then
-    echo "[*] Pre-compiled Native AOT binary not found at:"
-    echo "    ${BIN_SRC}"
+    echo "[*] Pre-compiled Native AOT binary not found in release bundle or build tree."
     if command -v dotnet >/dev/null 2>&1; then
         echo "[*] .NET SDK detected. Compiling Native AOT binary..."
         (
