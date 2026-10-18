@@ -1165,22 +1165,37 @@ let ``Goodix53xdDevice ReadFdtManual sends mode 0x0d and returns decoded 8 words
     }
 
 [<Fact>]
-let ``Goodix53xdDevice WaitForFingerUpRobust falls back to FDT manual polling on 0x34 timeout`` () =
+let ``FdtCalculations isFingerLifted correctly distinguishes idle, touched, and lifted states`` () =
+    let idle = [| 260us; 250us; 286us; 283us; 296us; 288us; 294us; 286us |]
+
+    // 1. Exact idle returns lifted
+    let (lifted1, delta1) = FdtCalculations.isFingerLifted idle idle
+    Assert.True(lifted1)
+    Assert.Equal(0.0, delta1, 1)
+
+    // 2. Normal idle jitter (noise +- 2) returns lifted
+    let noisyIdle = [| 259us; 249us; 286us; 283us; 296us; 288us; 293us; 285us |]
+    let (lifted2, delta2) = FdtCalculations.isFingerLifted noisyIdle idle
+    Assert.True(lifted2)
+    Assert.True(delta2 > -30.0)
+
+    // 3. Live finger-down readings from hardware (~ -212 delta) return NOT lifted (finger present)
+    let fingerDown = [| 48us; 45us; 73us; 73us; 80us; 72us; 75us; 74us |]
+    let (lifted3, delta3) = FdtCalculations.isFingerLifted fingerDown idle
+    Assert.False(lifted3)
+    Assert.True(delta3 < -80.0)
+
+    // 4. All channels within 40 counts return lifted even if mean delta is slightly negative
+    let slightlyNegative = [| 240us; 230us; 266us; 263us; 276us; 268us; 274us; 266us |] // all diffs = -20
+    let (lifted4, delta4) = FdtCalculations.isFingerLifted slightlyNegative idle
+    Assert.True(lifted4)
+    Assert.Equal(-20.0, delta4, 1)
+
+[<Fact>]
+let ``Goodix53xdDevice WaitForFingerUpRobust detects finger lift with pure FDT manual polling`` () =
     task {
         let mockTransport = new MockUsbTransport()
 
-        // 1. WaitForFingerUp: ACK for fdtUpNoReply (0x34)
-        let ackUp0 = Protocol.encodeMessagePack Protocol.FlagsMessageProtocol (Protocol.encodeMessageProtocol Protocol.CommandAck [| Protocol.CommandMcuSwitchToFdtUp; 0x03uy |] true)
-        mockTransport.EnqueueResponse(ackUp0)
-
-        // 2. WaitForFingerUp: ACK for fdtUpWait (0x34)
-        let ackUp1 = Protocol.encodeMessagePack Protocol.FlagsMessageProtocol (Protocol.encodeMessageProtocol Protocol.CommandAck [| Protocol.CommandMcuSwitchToFdtUp; 0x03uy |] true)
-        mockTransport.EnqueueResponse(ackUp1)
-
-        // 3. WaitForFingerUp: 0x34 timeout (simulating hardware failing to fire 0x34)
-        mockTransport.EnqueueError(Timeout "Hardware 0x34 event timed out")
-
-        // 3. Fallback poll 1: ReadFdtManual
         let ackMode0 = Protocol.encodeMessagePack Protocol.FlagsMessageProtocol (Protocol.encodeMessageProtocol Protocol.CommandAck [| Protocol.CommandMcuSwitchToFdtMode; 0x03uy |] true)
         let ackMode1 = Protocol.encodeMessagePack Protocol.FlagsMessageProtocol (Protocol.encodeMessageProtocol Protocol.CommandAck [| Protocol.CommandMcuSwitchToFdtMode; 0x03uy |] true)
 
@@ -1191,22 +1206,22 @@ let ``Goodix53xdDevice WaitForFingerUpRobust falls back to FDT manual polling on
             respPayload1.[4 + 2 * i + 1] <- byte (clearWords1.[i] >>> 8)
         let respPack1 = Protocol.encodeMessagePack Protocol.FlagsMessageProtocol (Protocol.encodeMessageProtocol Protocol.CommandMcuSwitchToFdtMode respPayload1 true)
 
-        // 3. Fallback poll: baseline read
+        // 1. Initial idle read (when sessionIdle is None)
         mockTransport.EnqueueResponse(ackMode0)
         mockTransport.EnqueueResponse(ackMode1)
         mockTransport.EnqueueResponse(respPack1)
 
-        // 4. Fallback poll 1: ReadFdtManual (consecutive clear sample 1)
+        // 2. Poll 1: ReadFdtManual (consecutive clear sample 1)
         mockTransport.EnqueueResponse(ackMode0)
         mockTransport.EnqueueResponse(ackMode1)
         mockTransport.EnqueueResponse(respPack1)
 
-        // 5. Fallback poll 2: ReadFdtManual (consecutive clear sample 2)
+        // 3. Poll 2: ReadFdtManual (consecutive clear sample 2)
         mockTransport.EnqueueResponse(ackMode0)
         mockTransport.EnqueueResponse(ackMode1)
         mockTransport.EnqueueResponse(respPack1)
 
-        // 6. Sleep command ACK (0x60)
+        // 4. Sleep command ACK (0x60)
         let ackSleep = Protocol.encodeMessagePack Protocol.FlagsMessageProtocol (Protocol.encodeMessageProtocol Protocol.CommandAck [| Protocol.CommandMcuSwitchToSleepMode; 0x03uy |] true)
         mockTransport.EnqueueResponse(ackSleep)
 

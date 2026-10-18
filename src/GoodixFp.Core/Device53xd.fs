@@ -76,6 +76,72 @@ module FdtCalculations =
                     upBase.[2 * i + 1] <- byte untVal
             upBase
 
+    /// Checks whether an FDT reading sample indicates the finger has been lifted.
+    /// Finger considered PRESENT if mean(delta) < -80;
+    /// LIFTED if every channel is within 40 counts of sessionIdle (or mean(delta) > -30).
+    let isFingerLifted (sample: uint16[]) (sessionIdle: uint16[]) : bool * float =
+        if isNull sample || isNull sessionIdle || sample.Length < 8 || sessionIdle.Length < 8 then
+            false, 0.0
+        else
+            let mutable allWithin40 = true
+            let mutable sumDelta = 0
+            for i in 0 .. 7 do
+                let diff = int sample.[i] - int sessionIdle.[i]
+                sumDelta <- sumDelta + diff
+                if abs diff > 40 then
+                    allWithin40 <- false
+            let meanDelta = float sumDelta / 8.0
+            let isLifted = allWithin40 || meanDelta > -30.0
+            isLifted, meanDelta
+
+module private DeviceDebug =
+    let logBaselineIdle (idleWords: uint16[]) =
+        let v = Environment.GetEnvironmentVariable("GOODIX_DEBUG")
+        if v = "1" || String.Equals(v, "true", StringComparison.OrdinalIgnoreCase) then
+            let idleStr = idleWords |> Array.map (fun v -> (int v).ToString().PadLeft(4)) |> String.concat " "
+            eprintfn $"[DEBUG][ActivateSession] Baseline idle: [ {idleStr} ]"
+
+    let logFingerDown (downPayload: byte[]) (sessionIdle: uint16[] option) (currentFdtIdle: uint16[] option) =
+        let v = Environment.GetEnvironmentVariable("GOODIX_DEBUG")
+        if (v = "1" || String.Equals(v, "true", StringComparison.OrdinalIgnoreCase)) && downPayload.Length >= 20 then
+            let refIdle = sessionIdle |> Option.orElse currentFdtIdle
+            match refIdle with
+            | Some idle when idle.Length >= 8 ->
+                let touchFlag = uint16 downPayload.[2] ||| (uint16 downPayload.[3] <<< 8)
+                let fdtData = Array.sub downPayload 4 16
+                let downWords = [| for i in 0 .. 7 -> uint16 fdtData.[2 * i] ||| (uint16 fdtData.[2 * i + 1] <<< 8) |]
+                let fdtStr = downWords |> Array.map (fun v -> (int v).ToString().PadLeft(4)) |> String.concat " "
+                let deltaStr =
+                    Array.map2 (fun curr baseVal ->
+                        let diff = int curr - int baseVal
+                        let sign = if diff >= 0 then "+" else ""
+                        (sign + diff.ToString()).PadLeft(5)
+                    ) downWords idle
+                    |> String.concat " "
+                let meanDelta = (float (Array.sumBy (fun i -> int downWords.[i] - int idle.[i]) [| 0 .. 7 |])) / 8.0
+                eprintfn $"[DEBUG][FingerDown] 0x32 event! flag=0x{touchFlag:X4} FDT: [ {fdtStr} ] | delta: [ {deltaStr} ] (mean={meanDelta,6:F1})"
+            | _ -> ()
+
+    let logPostTouch (postTouchResp: byte[]) (sessionIdle: uint16[] option) (currentFdtIdle: uint16[] option) =
+        let v = Environment.GetEnvironmentVariable("GOODIX_DEBUG")
+        if (v = "1" || String.Equals(v, "true", StringComparison.OrdinalIgnoreCase)) && postTouchResp.Length >= 20 then
+            let refIdle = sessionIdle |> Option.orElse currentFdtIdle
+            match refIdle with
+            | Some idle when idle.Length >= 8 ->
+                let rawFdt = Array.sub postTouchResp 4 16
+                let postWords = [| for i in 0 .. 7 -> uint16 rawFdt.[2 * i] ||| (uint16 rawFdt.[2 * i + 1] <<< 8) |]
+                let fdtStr = postWords |> Array.map (fun v -> (int v).ToString().PadLeft(4)) |> String.concat " "
+                let deltaStr =
+                    Array.map2 (fun curr baseVal ->
+                        let diff = int curr - int baseVal
+                        let sign = if diff >= 0 then "+" else ""
+                        (sign + diff.ToString()).PadLeft(5)
+                    ) postWords idle
+                    |> String.concat " "
+                let meanDelta = (float (Array.sumBy (fun i -> int postWords.[i] - int idle.[i]) [| 0 .. 7 |])) / 8.0
+                eprintfn $"[DEBUG][FingerDown] Post-touch 0x36: FDT: [ {fdtStr} ] | delta: [ {deltaStr} ] (mean={meanDelta,6:F1})"
+            | _ -> ()
+
 // ============================================================================
 // High-Level Goodix 53xd Driver
 // ============================================================================
@@ -87,6 +153,7 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
     let mutable lastFdtUpBase: byte[] option = None
     let mutable currentFdtDownBase: byte[] option = None
     let mutable currentFdtIdle: uint16[] option = None
+    let mutable sessionIdle: uint16[] option = None
 
     new(transport: IUsbTransport) =
         new Goodix53xdDevice(transport, new PureFSharpTlsPskTunnel())
@@ -98,6 +165,7 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
     member this.LastFdtUpBase = lastFdtUpBase
     member this.CurrentFdtDownBase = currentFdtDownBase
     member this.CurrentFdtIdle = currentFdtIdle
+    member this.SessionIdle = sessionIdle
 
     // ------------------------------------------------------------------------
     // Low-Level Packet Exchange Helpers
@@ -482,6 +550,7 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
             let rawFdt = Array.sub fdtResp0 4 16
             let idleWords = [| for i in 0 .. 7 -> uint16 rawFdt.[2 * i] ||| (uint16 rawFdt.[2 * i + 1] <<< 8) |]
             currentFdtIdle <- Some idleWords
+            sessionIdle <- Some idleWords
             let downBase = FdtCalculations.calcFdtDownBase rawFdt
             currentFdtDownBase <- Some downBase
 
@@ -545,8 +614,10 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
             let rawFdt = Array.sub fdtResp 4 16
             let idleWords = [| for i in 0 .. 7 -> uint16 rawFdt.[2 * i] ||| (uint16 rawFdt.[2 * i + 1] <<< 8) |]
             currentFdtIdle <- Some idleWords
+            sessionIdle <- Some idleWords
             let downBase = FdtCalculations.calcFdtDownBase rawFdt
             currentFdtDownBase <- Some downBase
+            DeviceDebug.logBaselineIdle idleWords
 
         // 8.19: mcu_switch_to_sleep_mode
         do! this.SendAndExpectAck(Protocol.packSwitchToSleepMode(), Protocol.CommandMcuSwitchToSleepMode)
@@ -585,6 +656,7 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
 
     member this.WaitForFingerDown(?timeoutMs: int) : Task<Result<unit, DriverError>> = taskResult {
         let timeout = defaultArg timeoutMs 10000
+
         let otp =
             match currentOtp with
             | Some o -> o
@@ -622,13 +694,16 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
             let fdtData = Array.sub downPayload 4 16
             let upBase = FdtCalculations.calcFdtUpBase touchFlag fdtData None
             lastFdtUpBase <- Some upBase
+            DeviceDebug.logFingerDown downPayload sessionIdle currentFdtIdle
 
         // 4. Immediately perform post-touch 0x36 mode switch (matching driver_53xd.py lines 242-252)
         let fdt0dPostNoReply = Array.concat [| [| 0x0duy; 0x01uy |]; dacBytes; downThresholds; [| 0x00uy |] |]
         do! this.SendAndExpectAck(Protocol.packSwitchToFdtMode fdt0dPostNoReply, Protocol.CommandMcuSwitchToFdtMode)
 
         let fdt0dPostWait = Array.concat [| [| 0x0duy; 0x01uy |]; dacBytes; downThresholds; [| 0x01uy |] |]
-        let! _ = this.SendAndReceive(Protocol.packSwitchToFdtMode fdt0dPostWait, Protocol.CommandMcuSwitchToFdtMode)
+        let! postTouchResp = this.SendAndReceive(Protocol.packSwitchToFdtMode fdt0dPostWait, Protocol.CommandMcuSwitchToFdtMode)
+
+        DeviceDebug.logPostTouch postTouchResp sessionIdle currentFdtIdle
 
         return ()
     }
@@ -652,7 +727,12 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
             otp.DacH; 0x00uy; otp.DacH - 6uy; 0x00uy
             otp.DacL; 0x00uy; otp.DacL - 4uy; 0x00uy
         |]
-        return! this.CaptureRawFrameInternal(imgPayload)
+        let! rawFrame = this.CaptureRawFrameInternal(imgPayload)
+
+        // Reset sensor register 0x022c back to FDT mode [0x0a; 0x02] (matching Milan TOD / ActivateSession steps 8.11, 8.16)
+        do! this.SendAndExpectAck(Protocol.packWriteSensorRegister 0x022cus [| 0x0auy; 0x02uy |], Protocol.CommandWriteSensorRegister)
+
+        return rawFrame
     }
 
     // ------------------------------------------------------------------------
@@ -724,55 +804,34 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
         return ()
     }
 
-    /// Robust finger-up detection: tries hardware 0x34 event with a short timeout,
-    /// then falls back to polling FDT manual mode (0x36) until FDT values return to
+    /// Robust finger-up detection: polls FDT manual mode (0x36) until FDT values return to
     /// baseline idle tolerance (requiring 2 consecutive clear samples).
+    /// Pure 0x36 polling exactly mirrors fdt-monitor and avoids leftover 0x34 arming.
     /// Re-arms the MCU to sleep mode afterwards.
     member this.WaitForFingerUpRobust(?timeoutMs: int, ?onStillHolding: unit -> unit) : Task<Result<unit, DriverError>> = task {
         let totalTimeout = defaultArg timeoutMs 15000
         let sw = Stopwatch.StartNew()
+        let isGoodixDebug =
+            let v = Environment.GetEnvironmentVariable("GOODIX_DEBUG")
+            v = "1" || String.Equals(v, "true", StringComparison.OrdinalIgnoreCase)
 
-        // 1. First try hardware 0x34 event with short timeout (1000ms)
-        let! hwFired = task {
-            let! hwRes = this.WaitForFingerUp(timeoutMs = 1000)
-            match hwRes with
-            | Ok () ->
-                let _ = this.SendAndExpectAck(Protocol.packSwitchToSleepMode(), Protocol.CommandMcuSwitchToSleepMode)
-                transport.DrainBuffer()
-                return true
-            | Error _ ->
-                transport.DrainBuffer()
-                return false
-        }
+        // Drain any pending USB packets from previous commands
+        transport.DrainBuffer(50)
 
-        if hwFired then
-            return Ok ()
-        else
-
-        // 2. Fall back to polling FDT manual reading (0x36)
+        // Determine session baseline idle reference (never overwrite sessionIdle with touch data)
         let! idle = task {
-            match currentFdtIdle with
+            let existing = sessionIdle |> Option.orElse currentFdtIdle
+            match existing with
             | Some id -> return id
             | None ->
                 let! sRes = this.ReadFdtManual(timeoutMs = 1000)
                 match sRes with
                 | Ok s ->
+                    sessionIdle <- Some s
                     currentFdtIdle <- Some s
                     return s
-                | Error _ -> return Array.create 8 290us
+                | Error _ -> return Array.create 8 280us
         }
-
-        let isSampleClear (sample: uint16[]) : bool =
-            if sample.Length < 8 then false
-            else
-                let mutable clear = true
-                for i in 0 .. 7 do
-                    let diff = abs (int sample.[i] - int idle.[i])
-                    let downDelta = int idle.[i] - (int idle.[i] >>> 1)
-                    let tol = max 15 (downDelta / 3)
-                    if diff > tol then
-                        clear <- false
-                clear
 
         let mutable consecutiveClear = 0
         let mutable lastHintTime = sw.ElapsedMilliseconds
@@ -782,7 +841,8 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
             let! pollRes = this.ReadFdtManual(timeoutMs = 1000)
             match pollRes with
             | Ok sample ->
-                if isSampleClear sample then
+                let isClear, meanDelta = FdtCalculations.isFingerLifted sample idle
+                if isClear then
                     consecutiveClear <- consecutiveClear + 1
                     if consecutiveClear >= 2 then
                         finished <- true
@@ -793,15 +853,31 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
                         match onStillHolding with
                         | Some cb -> cb ()
                         | None -> ()
-            | Error _ ->
-                transport.DrainBuffer()
+
+                if isGoodixDebug then
+                    let fdtStr = sample |> Array.map (fun v -> (int v).ToString().PadLeft(4)) |> String.concat " "
+                    let deltaStr =
+                        Array.map2 (fun curr baseVal ->
+                            let diff = int curr - int baseVal
+                            let sign = if diff >= 0 then "+" else ""
+                            (sign + diff.ToString()).PadLeft(5)
+                        ) sample idle
+                        |> String.concat " "
+                    let status = if isClear then $"CLEAR (streak {consecutiveClear}/2)" else "TOUCHED"
+                    eprintfn $"[DEBUG][FingerUp] FDT: [ {fdtStr} ] | delta: [ {deltaStr} ] (mean={meanDelta,6:F1}, {status})"
+
+            | Error err ->
+                if isGoodixDebug then
+                    eprintfn $"[DEBUG][FingerUp] ReadFdtManual error: {err}"
+                transport.DrainBuffer(50)
+                consecutiveClear <- 0
 
             if not finished then
-                do! Task.Delay 100
+                do! Task.Delay 50
 
         if finished then
             let _ = this.SendAndExpectAck(Protocol.packSwitchToSleepMode(), Protocol.CommandMcuSwitchToSleepMode)
-            transport.DrainBuffer()
+            transport.DrainBuffer(50)
             return Ok ()
         else
             return Error (Timeout $"Finger was not lifted within {totalTimeout} ms")

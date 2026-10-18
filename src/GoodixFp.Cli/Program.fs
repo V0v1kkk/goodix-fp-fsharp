@@ -923,20 +923,28 @@ module DeviceRunner =
                 eprintfn $"[!] Activation failed: {err}"
                 return 1
             | Ok _ ->
-                printfn "[*] Testing WaitForFingerUpRobust with NO finger on sensor..."
+                printfn "[*] Simulating enroll workflow: capturing frame without finger (image mode)..."
                 Console.Out.Flush()
-                let sw = Stopwatch.StartNew()
-                let! upRes = dev.WaitForFingerUpRobust(timeoutMs = 5000)
-                sw.Stop()
-                match upRes with
-                | Ok () ->
-                    printfn $"[+] WaitForFingerUpRobust returned OK in {sw.ElapsedMilliseconds} ms (< 2000 ms target)"
-                    let! _ = dev.Sleep()
-                    return 0
+                let! capRes = dev.CaptureFrame()
+                match capRes with
                 | Error err ->
-                    eprintfn $"[!] WaitForFingerUpRobust failed: {err}"
-                    let! _ = dev.Sleep()
+                    eprintfn $"[!] Frame capture failed: {err}"
                     return 1
+                | Ok _frame ->
+                    printfn "[*] Testing WaitForFingerUpRobust with NO finger on sensor (post-capture)..."
+                    Console.Out.Flush()
+                    let sw = Stopwatch.StartNew()
+                    let! upRes = dev.WaitForFingerUpRobust(timeoutMs = 5000)
+                    sw.Stop()
+                    match upRes with
+                    | Ok () ->
+                        printfn $"[+] WaitForFingerUpRobust returned OK in {sw.ElapsedMilliseconds} ms (< 2000 ms target)"
+                        let! _ = dev.Sleep()
+                        return 0
+                    | Error err ->
+                        eprintfn $"[!] WaitForFingerUpRobust failed: {err}"
+                        let! _ = dev.Sleep()
+                        return 1
         })
 
 module Program =
