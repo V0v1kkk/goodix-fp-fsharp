@@ -42,21 +42,22 @@ jobs:
       - name: Publish Native AOT CLI binary
         run: |
           dotnet publish src/GoodixFp.Cli/GoodixFp.Cli.fsproj -c Release -r linux-x64
-          cp src/GoodixFp.Cli/bin/Release/net10.0/linux-x64/publish/GoodixFp.Cli src/GoodixFp.Cli/bin/Release/net10.0/linux-x64/publish/goodix-fp
-          chmod +x src/GoodixFp.Cli/bin/Release/net10.0/linux-x64/publish/goodix-fp
+          mkdir -p staging-bin
+          cp src/GoodixFp.Cli/bin/Release/net10.0/linux-x64/publish/GoodixFp.Cli staging-bin/goodix-fp
+          chmod +x staging-bin/goodix-fp
 
       - name: Publish Native AOT fprintd Daemon binary
         run: |
           dotnet publish src/GoodixFp.Daemon/GoodixFp.Daemon.fsproj -c Release -r linux-x64
-          chmod +x src/GoodixFp.Daemon/bin/Release/net10.0/linux-x64/publish/goodix-fprintd
+          mkdir -p staging-bin
+          cp src/GoodixFp.Daemon/bin/Release/net10.0/linux-x64/publish/goodix-fprintd staging-bin/goodix-fprintd
+          chmod +x staging-bin/goodix-fprintd
 
       - name: Upload Native AOT binary artifacts
         uses: actions/upload-artifact@v4
         with:
           name: goodix-fp-binaries-linux-x64
-          path: |
-            src/GoodixFp.Cli/bin/Release/net10.0/linux-x64/publish/goodix-fp
-            src/GoodixFp.Daemon/bin/Release/net10.0/linux-x64/publish/goodix-fprintd
+          path: staging-bin/
           if-no-files-found: error
 
   release:
@@ -84,15 +85,28 @@ jobs:
           BUNDLE_DIR="./${BUNDLE_NAME}"
           mkdir -p "${BUNDLE_DIR}"
 
+          # Locate compiled binaries inside downloaded artifact
+          CLI_SRC=$(find ./dist-bin -name "goodix-fp" -type f | head -n 1)
+          DAEMON_SRC=$(find ./dist-bin -name "goodix-fprintd" -type f | head -n 1)
+
+          if [ -z "$CLI_SRC" ] || [ -z "$DAEMON_SRC" ]; then
+            echo "ERROR: Could not locate compiled binaries in ./dist-bin"
+            ls -laR ./dist-bin
+            exit 1
+          fi
+
+          echo "Found CLI: $CLI_SRC"
+          echo "Found Daemon: $DAEMON_SRC"
+
           # Place raw executables
-          cp ./dist-bin/goodix-fp "${BUNDLE_DIR}/goodix-fp"
+          cp "$CLI_SRC" "${BUNDLE_DIR}/goodix-fp"
           chmod +x "${BUNDLE_DIR}/goodix-fp"
-          cp ./dist-bin/goodix-fp ./goodix-fp
+          cp "$CLI_SRC" ./goodix-fp
           chmod +x ./goodix-fp
 
-          cp ./dist-bin/goodix-fprintd "${BUNDLE_DIR}/goodix-fprintd"
+          cp "$DAEMON_SRC" "${BUNDLE_DIR}/goodix-fprintd"
           chmod +x "${BUNDLE_DIR}/goodix-fprintd"
-          cp ./dist-bin/goodix-fprintd ./goodix-fprintd
+          cp "$DAEMON_SRC" ./goodix-fprintd
           chmod +x ./goodix-fprintd
 
           # Copy installer scripts, packaging, and docs

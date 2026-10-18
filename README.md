@@ -6,6 +6,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Tests](https://img.shields.io/badge/Tests-71%20Passed-brightgreen)](tests/GoodixFp.Tests/)
 [![CI/CD](https://github.com/V0v1kkk/goodix-fp-fsharp/actions/workflows/ci.yml/badge.svg)](https://github.com/V0v1kkk/goodix-fp-fsharp/actions/workflows/ci.yml)
+[![GitHub Release](https://img.shields.io/github/v/release/V0v1kkk/goodix-fp-fsharp?logo=github)](https://github.com/V0v1kkk/goodix-fp-fsharp/releases)
 
 Production-grade, pure **F# 10** reverse-engineered driver, matcher CLI, and **fprintd D-Bus Bridge daemon** for **Goodix 53xc / 53xd** fingerprint sensors (e.g., `0x27c6:0x538d`, `0x27c6:0x530c`, `0x27c6:0x532d` found on Dell XPS 13 9300/9310, Inspiron, and Vostro laptops).
 
