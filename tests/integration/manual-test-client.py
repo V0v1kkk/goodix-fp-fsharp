@@ -43,7 +43,7 @@ async def run_scenario_1(bus):
 
     status_events = []
     def on_msg(msg):
-        if msg.message_type == MessageType.SIGNAL and msg.sender == SERVICE:
+        if msg.message_type == MessageType.SIGNAL and (msg.interface == DEVICE_IFACE or msg.member in ("VerifyFingerSelected", "VerifyFingerMatched", "VerifyStatus")):
             if msg.member == "VerifyFingerSelected":
                 print(f"  --> [SIGNAL] VerifyFingerSelected: {msg.body[0]}")
             elif msg.member == "VerifyFingerMatched":
@@ -103,7 +103,7 @@ async def run_scenario_2(bus):
 
     status_events = []
     def on_msg(msg):
-        if msg.message_type == MessageType.SIGNAL and msg.sender == SERVICE:
+        if msg.message_type == MessageType.SIGNAL and (msg.interface == DEVICE_IFACE or msg.member in ("VerifyFingerSelected", "VerifyFingerMatched", "VerifyStatus")):
             if msg.member == "VerifyStatus":
                 st, done = msg.body
                 print(f"  --> [SIGNAL] VerifyStatus: result='{st}', done={done}")
@@ -223,7 +223,7 @@ async def main():
     await bus.call(Message(
         destination="org.freedesktop.DBus", path="/org/freedesktop/DBus",
         interface="org.freedesktop.DBus", member="AddMatch",
-        signature="s", body=[f"type='signal',sender='{SERVICE}'"]
+        signature="s", body=[f"type='signal',interface='{DEVICE_IFACE}'"]
     ))
 
     if check_only:

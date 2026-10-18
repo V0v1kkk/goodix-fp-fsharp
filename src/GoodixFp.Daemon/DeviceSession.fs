@@ -110,6 +110,8 @@ type HardwareDeviceRunner(maxRetries: int) =
                     }
 
                     try
+                        printfn $"[*] [Device] Activating session for user '{user.Value}' ({templates.Length} template(s) loaded)..."
+                        Console.Out.Flush()
                         let! actRes = dev.ActivateSession()
                         match actRes with
                         | Error err ->
@@ -129,6 +131,8 @@ type HardwareDeviceRunner(maxRetries: int) =
                                 while not finished && not ct.IsCancellationRequested do
                                     onFingerNeededChanged true
                                     onFingerPresentChanged false
+                                    printfn $"[*] [Device] Waiting for finger touch (attempt {attempt}/{retries}, timeout {timeoutMs}ms)..."
+                                    Console.Out.Flush()
 
                                     let! downRes = dev.WaitForFingerDown(timeoutMs = timeoutMs, cancellationToken = ct)
                                     if ct.IsCancellationRequested then
@@ -155,6 +159,8 @@ type HardwareDeviceRunner(maxRetries: int) =
                                         | Ok () ->
                                             onFingerPresentChanged true
                                             onFingerNeededChanged false
+                                            printfn "[*] [Device] Finger touch detected! Capturing frame..."
+                                            Console.Out.Flush()
 
                                             let! capRes = dev.CaptureFrame()
                                             match capRes with
@@ -171,17 +177,23 @@ type HardwareDeviceRunner(maxRetries: int) =
                                                     onStatus (FprintConstants.VerifyStatuses.UnknownError, true)
                                                     finished <- true
                                                 | Ok (Some matchedFid) ->
+                                                    printfn $"[+] [Device] MATCH VERIFIED: {matchedFid.Value}!"
+                                                    Console.Out.Flush()
                                                     onMatched matchedFid.Value
                                                     onStatus (FprintConstants.VerifyStatuses.Match, true)
                                                     do! sleepSensor ()
                                                     finished <- true
                                                 | Ok None ->
                                                     if attempt < retries && not ct.IsCancellationRequested then
+                                                        printfn $"[-] [Device] Touch not recognized (attempt {attempt}/{retries}). Waiting for finger lift..."
+                                                        Console.Out.Flush()
                                                         onStatus (FprintConstants.VerifyStatuses.RetryScan, false)
                                                         let! _ = dev.WaitForFingerUpRobust(timeoutMs = 10000, cancellationToken = ct)
                                                         onFingerPresentChanged false
                                                         attempt <- attempt + 1
                                                     else
+                                                        printfn $"[-] [Device] Verification failed: no match after {retries} attempts."
+                                                        Console.Out.Flush()
                                                         onStatus (FprintConstants.VerifyStatuses.NoMatch, true)
                                                         do! sleepSensor ()
                                                         finished <- true
