@@ -37,6 +37,13 @@ DROPIN_BACKUP="${INSTALLER_STATE_DIR}/10-goodix-fsharp.conf.bak"
 DROPIN_DIR="/etc/systemd/system/fprintd.service.d"
 DROPIN_TARGET="${DROPIN_DIR}/10-goodix-fsharp.conf"
 DROPIN_SRC="${REPO_ROOT}/packaging/fprintd/10-goodix-fsharp.conf"
+if [[ ! -f "${DROPIN_SRC}" ]]; then
+    if [[ -f "${SCRIPT_DIR}/packaging/fprintd/10-goodix-fsharp.conf" ]]; then
+        DROPIN_SRC="${SCRIPT_DIR}/packaging/fprintd/10-goodix-fsharp.conf"
+    elif [[ -f "/tmp/goodix-fp/packaging/fprintd/10-goodix-fsharp.conf" ]]; then
+        DROPIN_SRC="/tmp/goodix-fp/packaging/fprintd/10-goodix-fsharp.conf"
+    fi
+fi
 
 MODE="dry-run"
 PURGE=0
@@ -202,6 +209,10 @@ find_binary() {
         "${REPO_ROOT}/publish-daemon/goodix-fprintd"
         "${REPO_ROOT}/publish-daemon/GoodixFp.Daemon"
         "${REPO_ROOT}/goodix-fprintd"
+        "${SCRIPT_DIR}/goodix-fprintd"
+        "/tmp/goodix-fp/bus-test/goodix-fprintd"
+        "/tmp/goodix-fp/manual-test/goodix-fprintd"
+        "/tmp/goodix-fp/goodix-fprintd"
         "${REPO_ROOT}/src/GoodixFp.Daemon/bin/Release/net10.0/goodix-fprintd"
         "${REPO_ROOT}/src/GoodixFp.Daemon/bin/Release/net10.0/GoodixFp.Daemon"
         "${DEST_BIN}"
