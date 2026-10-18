@@ -198,6 +198,7 @@ type PreprocessedFrame = {
     OutStruct: byte[]
     Quality: QualityScore
     Coverage: CoverageScore
+    SubtractedPixels: uint16[]
 }
 
 module PreprocessedFrame =
@@ -205,7 +206,7 @@ module PreprocessedFrame =
     let BDataSize = 19600
     let OutStructSize = 28
 
-    let createWithTrailer (pixels: byte[]) (bData: byte[]) (outStruct: byte[]) (quality: QualityScore) (coverage: CoverageScore) : Result<PreprocessedFrame, DriverError> =
+    let createWithTrailerAndSubtracted (pixels: byte[]) (bData: byte[]) (outStruct: byte[]) (quality: QualityScore) (coverage: CoverageScore) (subtractedPixels: uint16[]) : Result<PreprocessedFrame, DriverError> =
         if isNull pixels || pixels.Length <> PixelCount then
             Error (ValidationError ("PreprocessedFrame.NormalizedPixels", $"Expected {PixelCount} bytes, got {if isNull pixels then 0 else pixels.Length}"))
         elif isNull bData || bData.Length <> BDataSize then
@@ -216,13 +217,18 @@ module PreprocessedFrame =
                     Array.zeroCreate<byte> OutStructSize
                 else
                     Array.sub outStruct 0 OutStructSize
+            let sub = if isNull subtractedPixels then Array.zeroCreate<uint16> PixelCount else subtractedPixels
             Ok {
                 NormalizedPixels = Array.copy pixels
                 BData = Array.copy bData
                 OutStruct = trailer
                 Quality = quality
                 Coverage = coverage
+                SubtractedPixels = Array.copy sub
             }
+
+    let createWithTrailer (pixels: byte[]) (bData: byte[]) (outStruct: byte[]) (quality: QualityScore) (coverage: CoverageScore) : Result<PreprocessedFrame, DriverError> =
+        createWithTrailerAndSubtracted pixels bData outStruct quality coverage (Array.zeroCreate<uint16> PixelCount)
 
     let create (pixels: byte[]) (bData: byte[]) (quality: QualityScore) (coverage: CoverageScore) : Result<PreprocessedFrame, DriverError> =
         createWithTrailer pixels bData (Array.zeroCreate<byte> OutStructSize) quality coverage

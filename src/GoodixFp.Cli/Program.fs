@@ -386,6 +386,7 @@ module DeviceRunner =
                         return 1
                     | Ok () ->
                         let mutable enrolledCount = 0
+                        let mutable attemptCount = 0
                         let mutable failure = false
 
                         while enrolledCount < 12 && not failure do
@@ -435,23 +436,25 @@ module DeviceRunner =
 
                                         if fingerLifted then
                                             printfn "OK"
-                                            if enrolledCount = 0 then
-                                                try
-                                                    let dir = "/tmp/goodix-fp"
-                                                    if not (Directory.Exists dir) then Directory.CreateDirectory dir |> ignore
-                                                    let sampleRawPgm = FrameDecoder.toPgm12Bit frame.Pixels 80 64
-                                                    File.WriteAllBytes(Path.Combine(dir, "enroll-sample1-raw16.pgm"), sampleRawPgm)
-                                                    match matcher.Preprocess(frame) with
-                                                    | Ok p ->
-                                                        let enhPgm = FrameDecoder.toPgm8Bit p.NormalizedPixels 80 64
-                                                        File.WriteAllBytes(Path.Combine(dir, "enroll-sample1-enhanced8.pgm"), enhPgm)
-                                                    | _ -> ()
-                                                with _ -> ()
+                                            let dir = "/tmp/goodix-fp"
+                                            try
+                                                if not (Directory.Exists dir) then Directory.CreateDirectory dir |> ignore
+                                                let sampleRawPgm = FrameDecoder.toPgm12Bit frame.Pixels 80 64
+                                                File.WriteAllBytes(Path.Combine(dir, $"enroll-sample{enrolledCount + 1}-touch{attemptCount + 1}-raw16.pgm"), sampleRawPgm)
+                                                match matcher.Preprocess(frame) with
+                                                | Ok p ->
+                                                    let enhPgm = FrameDecoder.toPgm8Bit p.NormalizedPixels 80 64
+                                                    File.WriteAllBytes(Path.Combine(dir, $"enroll-sample{enrolledCount + 1}-touch{attemptCount + 1}-enhanced8.pgm"), enhPgm)
+                                                | _ -> ()
+                                            with _ -> ()
 
                                             match matcher.MergeSample(frame.Pixels) with
                                             | Error err ->
+                                                attemptCount <- attemptCount + 1
                                                 eprintfn $"[!] Touch rejected ({err}), please try step [{enrolledCount + 1}/12] again..."
+                                                eprintfn "    (Tip: Place finger firmly over the sensor with slight shift/roll from previous touches)"
                                             | Ok count ->
+                                                attemptCount <- 0
                                                 enrolledCount <- count
                                                 printfn $"[+] Sample [{enrolledCount}/12] accepted!"
                                                 Console.Out.Flush()

@@ -201,7 +201,9 @@ type GoodixTodMatcher(nativeFunctions: NativeFunctions, baselineFrame: RawFrame1
                             if qualCov.[0] > 0 then CoverageScore.createUnsafe (Math.Clamp(qualCov.[0], 25, 100))
                             elif qualCov.[1] > 0 then CoverageScore.createUnsafe (Math.Clamp(qualCov.[1], 25, 100))
                             else CoverageScore.createUnsafe (Math.Clamp(cCalc.Value, 25, 100))
-                        PreprocessedFrame.createWithTrailer enhBuf bData outStruct q c
+                        if Environment.GetEnvironmentVariable("GOODIX_DEBUG") = "1" then
+                            eprintfn $"[DEBUG][Preprocess] qualCov=[{qualCov.[0]}, {qualCov.[1]}], qCalc={qCalc.Value}, cCalc={cCalc.Value} -> final Q={q.Value}, C={c.Value}"
+                        PreprocessedFrame.createWithTrailerAndSubtracted enhBuf bData outStruct q c rawPixels
                 finally
                     rawHandle.Free()
                     bDataHandle.Free()
@@ -257,10 +259,14 @@ type GoodixTodMatcher(nativeFunctions: NativeFunctions, baselineFrame: RawFrame1
                         let msHandle = GCHandle.Alloc(maxSamples, GCHandleType.Pinned)
                         try
                             let rcMerge = nativeFunctions.AlgMergeFeatureInterface.Invoke(scHandle.AddrOfPinnedObject(), msHandle.AddrOfPinnedObject())
+                            if Environment.GetEnvironmentVariable("GOODIX_DEBUG") = "1" then
+                                eprintfn $"[DEBUG][Merge] rcMerge={rcMerge}, sampleCount={sampleCount.[0]}, maxSamples={maxSamples.[0]}"
                             if rcMerge <> 0 then
                                 Error (ProtocolError $"AlgMergeFeatureInterface failed with code {rcMerge}")
                             else
                                 let rcStatus = nativeFunctions.AlgUpdateEnrollstatusInterface.Invoke()
+                                if Environment.GetEnvironmentVariable("GOODIX_DEBUG") = "1" then
+                                    eprintfn $"[DEBUG][Merge] rcStatus=0x{rcStatus:x8}"
                                 if rcStatus = 0 then
                                     enrolledSamples <- 12
                                     Ok 12
@@ -281,7 +287,7 @@ type GoodixTodMatcher(nativeFunctions: NativeFunctions, baselineFrame: RawFrame1
     member this.MergeSample(rawPixels: uint16[]) : Result<int, DriverError> =
         result {
             let! prep = this.Preprocess(rawPixels)
-            return! this.MergeSample(rawPixels, prep.NormalizedPixels, prep.Quality, prep.Coverage, prep.BData, prep.OutStruct)
+            return! this.MergeSample(prep.SubtractedPixels, prep.NormalizedPixels, prep.Quality, prep.Coverage, prep.BData, prep.OutStruct)
         }
 
     member this.CommitTemplate(?fingerId: FingerId) : Result<TemplateBlob, DriverError> =
@@ -371,7 +377,7 @@ type GoodixTodMatcher(nativeFunctions: NativeFunctions, baselineFrame: RawFrame1
             let mutable matchedFinger = None
             for (fid, blob) in templates do
                 if matchedFinger.IsNone then
-                    let! (matched, _) = this.IdentifyProbe(rawPixels, prep.NormalizedPixels, blob.Value, q, c, prep.BData, prep.OutStruct)
+                    let! (matched, _) = this.IdentifyProbe(prep.SubtractedPixels, prep.NormalizedPixels, blob.Value, q, c, prep.BData, prep.OutStruct)
                     if matched then
                         matchedFinger <- Some fid
             return matchedFinger
