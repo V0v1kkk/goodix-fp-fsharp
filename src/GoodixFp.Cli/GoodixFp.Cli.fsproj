@@ -5,7 +5,10 @@
     <TargetFramework>net10.0</TargetFramework>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <PublishAot>true</PublishAot>
+    <PublishTrimmed>true</PublishTrimmed>
+    <TrimMode>full</TrimMode>
     <InvariantGlobalization>true</InvariantGlobalization>
+    <IlcFoldIdenticalMethodBodies>true</IlcFoldIdenticalMethodBodies>
     <StripSymbols>true</StripSymbols>
     <NoWarn>$(NoWarn);IL2104;IL3053;IL2075;IL2026;FS3511;3511</NoWarn>
   </PropertyGroup>
@@ -21,8 +24,6 @@
 
   <ItemGroup>
     <PackageReference Include="FsToolkit.ErrorHandling" Version="5.2.0" />
-    <TrimmerRootAssembly Include="BouncyCastle.Cryptography" />
-    <RdXmlFile Include="rd.xml" />
   </ItemGroup>
 
 </Project>

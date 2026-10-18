@@ -3,7 +3,7 @@ namespace GoodixFp.Core
 open System
 
 // ============================================================================
-// Canonical [<Struct>] Single-Case DU Discipline (Vladimir's F# Style Guide)
+// Canonical [<Struct>] Single-Case DU Discipline
 // ============================================================================
 
 [<Struct>]

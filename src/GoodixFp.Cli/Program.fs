@@ -4,7 +4,6 @@ open System
 open System.IO
 open System.Diagnostics
 open System.Threading.Tasks
-open Org.BouncyCastle.Tls
 open FsToolkit.ErrorHandling
 open GoodixFp.Core
 open GoodixFp.NativeMatcher
@@ -39,7 +38,6 @@ type CliOptions = {
     Prefix: string option
     Seconds: int option
     Retries: int
-    UseBouncyCastle: bool
     Vid: uint16
     Pid: uint16
     Quiet: bool
@@ -55,7 +53,6 @@ module CommandLine =
         Prefix = None
         Seconds = None
         Retries = 3
-        UseBouncyCastle = false
         Vid = 0x27c6us
         Pid = 0x538dus
         Quiet = false
@@ -126,12 +123,6 @@ module CommandLine =
         | [] -> Ok opts
         | "--calibrate-only" :: rest ->
             parseOptions rest { opts with Command = "calibrate" }
-        | "--tls" :: "bc" :: rest ->
-            parseOptions rest { opts with UseBouncyCastle = true }
-        | "--tls" :: "pure" :: rest ->
-            parseOptions rest { opts with UseBouncyCastle = false }
-        | "--tls" :: other :: _ ->
-            Error $"Invalid TLS engine '{other}'. Expected 'pure' or 'bc'."
         | "--retries" :: [] ->
             Error "The '--retries' option requires an integer argument."
         | "--retries" :: PositiveInt n :: rest ->
@@ -168,11 +159,7 @@ module DeviceRunner =
             let! vid = UsbVid.create opts.Vid |> Result.mapError (fun e -> ValidationError ("VID", e))
             let! pid = UsbPid.create opts.Pid |> Result.mapError (fun e -> ValidationError ("PID", e))
             let! transport = LibUsbTransport.Open(vid, pid)
-            let tunnel : ITlsPskTunnel =
-                if opts.UseBouncyCastle then
-                    new BouncyCastleTlsPskTunnel() :> ITlsPskTunnel
-                else
-                    new PureFSharpTlsPskTunnel() :> ITlsPskTunnel
+            let tunnel : ITlsPskTunnel = new PureFSharpTlsPskTunnel() :> ITlsPskTunnel
             return new Goodix53xdDevice(transport, tunnel)
         }
 
@@ -312,8 +299,7 @@ module DeviceRunner =
 
     let runCalibrate (opts: CliOptions) : Task<int> =
         let prefix = defaultArg opts.Prefix "calib"
-        let tlsEngine = if opts.UseBouncyCastle then "BouncyCastle" else "Pure F#"
-        printfn $"[*] Initializing calibration session (TLS: {tlsEngine})..."
+        printfn "[*] Initializing calibration session..."
         withDevice opts (fun dev -> task {
             printfn "[*] Activating session and performing TLS handshake..."
             let! actRes = dev.ActivateSession()
@@ -346,8 +332,7 @@ module DeviceRunner =
 
     let runCapture (opts: CliOptions) : Task<int> =
         let prefix = defaultArg opts.Prefix "capture"
-        let tlsEngine = if opts.UseBouncyCastle then "BouncyCastle" else "Pure F#"
-        printfn $"[*] Initializing capture session (TLS: {tlsEngine})..."
+        printfn "[*] Initializing capture session..."
         withDevice opts (fun dev -> task {
             printfn "[*] Activating session and performing TLS handshake..."
             let! actRes = dev.ActivateSession()
@@ -588,90 +573,35 @@ module DeviceRunner =
         printfn "=================================================================\n"
 
         // --------------------------------------------------------------------
-        // [1/5] TLS 1.2 PSK Handshake: Pure F# vs BouncyCastle (200 iterations)
+        // [1/5] TLS 1.2 PSK Handshake: Pure F# RFC 4279 / RFC 5246 (200 iterations)
         // --------------------------------------------------------------------
         printfn "[1/5] TLS 1.2 PSK Handshake (200 iterations):"
         let psk = Array.zeroCreate<byte> 32
 
         // Warmup Pure F#
         for _ in 1 .. 5 do
-            let client = new TlsClientProtocol()
-            client.Connect(TestPskTlsClient(psk))
+            let client = new PureTlsPskClient(psk)
             use server = new PureFSharpTlsPskTunnel(psk)
-            let chLen = client.GetAvailableOutputBytes()
-            let chBuf = Array.zeroCreate<byte> chLen
-            client.ReadOutput(chBuf, 0, chLen) |> ignore
-            let shBytes = ((server :> ITlsPskTunnel).HandleHandshake(chBuf) |> Result.defaultWith (fun e -> failwith (string e))).Value
-            client.OfferInput(shBytes)
-            let cFlightLen = client.GetAvailableOutputBytes()
-            let cFlightBuf = Array.zeroCreate<byte> cFlightLen
-            client.ReadOutput(cFlightBuf, 0, cFlightLen) |> ignore
-            let sfBytes = ((server :> ITlsPskTunnel).HandleHandshake(cFlightBuf) |> Result.defaultWith (fun e -> failwith (string e))).Value
-            client.OfferInput(sfBytes)
+            let ch = client.CreateClientHello()
+            let sh = ((server :> ITlsPskTunnel).HandleHandshake(ch) |> Result.defaultWith (fun e -> failwith (string e))).Value
+            let cFlight = client.ProcessServerHello(sh)
+            let sf = ((server :> ITlsPskTunnel).HandleHandshake(cFlight) |> Result.defaultWith (fun e -> failwith (string e))).Value
+            client.ProcessServerFinished(sf) |> ignore
 
         let swPureHs = Stopwatch.StartNew()
         for _ in 1 .. 200 do
-            let client = new TlsClientProtocol()
-            client.Connect(TestPskTlsClient(psk))
+            let client = new PureTlsPskClient(psk)
             use server = new PureFSharpTlsPskTunnel(psk)
-            let chLen = client.GetAvailableOutputBytes()
-            let chBuf = Array.zeroCreate<byte> chLen
-            client.ReadOutput(chBuf, 0, chLen) |> ignore
-            let shBytes = ((server :> ITlsPskTunnel).HandleHandshake(chBuf) |> Result.defaultWith (fun e -> failwith (string e))).Value
-            client.OfferInput(shBytes)
-            let cFlightLen = client.GetAvailableOutputBytes()
-            let cFlightBuf = Array.zeroCreate<byte> cFlightLen
-            client.ReadOutput(cFlightBuf, 0, cFlightLen) |> ignore
-            let sfBytes = ((server :> ITlsPskTunnel).HandleHandshake(cFlightBuf) |> Result.defaultWith (fun e -> failwith (string e))).Value
-            client.OfferInput(sfBytes)
+            let ch = client.CreateClientHello()
+            let sh = ((server :> ITlsPskTunnel).HandleHandshake(ch) |> Result.defaultWith (fun e -> failwith (string e))).Value
+            let cFlight = client.ProcessServerHello(sh)
+            let sf = ((server :> ITlsPskTunnel).HandleHandshake(cFlight) |> Result.defaultWith (fun e -> failwith (string e))).Value
+            client.ProcessServerFinished(sf) |> ignore
         swPureHs.Stop()
 
         let usPureHs = float swPureHs.ElapsedTicks * 1_000_000.0 / float Stopwatch.Frequency / 200.0
         let opsPureHs = 200.0 / swPureHs.Elapsed.TotalSeconds
-        printfn $"  Pure F# RFC 4279/5246 : {usPureHs,7:F1} us/op | {opsPureHs,7:F1} handshakes/sec"
-
-        // Warmup BouncyCastle
-        for _ in 1 .. 5 do
-            let client = new TlsClientProtocol()
-            client.Connect(TestPskTlsClient(psk))
-            use server = new BouncyCastleTlsPskTunnel(psk)
-            let pump () =
-                let cAvail = client.GetAvailableOutputBytes()
-                if cAvail > 0 then
-                    let cBuf = Array.zeroCreate<byte> cAvail
-                    client.ReadOutput(cBuf, 0, cAvail) |> ignore
-                    match (server :> ITlsPskTunnel).HandleHandshake(cBuf) with
-                    | Ok (Some sResp) -> client.OfferInput(sResp)
-                    | _ -> ()
-            let mutable iters = 0
-            while (not client.IsConnected || not (server :> ITlsPskTunnel).IsHandshakeComplete) && iters < 10 do
-                pump ()
-                iters <- iters + 1
-
-        let swBcHs = Stopwatch.StartNew()
-        for _ in 1 .. 200 do
-            let client = new TlsClientProtocol()
-            client.Connect(TestPskTlsClient(psk))
-            use server = new BouncyCastleTlsPskTunnel(psk)
-            let pump () =
-                let cAvail = client.GetAvailableOutputBytes()
-                if cAvail > 0 then
-                    let cBuf = Array.zeroCreate<byte> cAvail
-                    client.ReadOutput(cBuf, 0, cAvail) |> ignore
-                    match (server :> ITlsPskTunnel).HandleHandshake(cBuf) with
-                    | Ok (Some sResp) -> client.OfferInput(sResp)
-                    | _ -> ()
-            let mutable iters = 0
-            while (not client.IsConnected || not (server :> ITlsPskTunnel).IsHandshakeComplete) && iters < 10 do
-                pump ()
-                iters <- iters + 1
-        swBcHs.Stop()
-
-        let usBcHs = float swBcHs.ElapsedTicks * 1_000_000.0 / float Stopwatch.Frequency / 200.0
-        let opsBcHs = 200.0 / swBcHs.Elapsed.TotalSeconds
-        let speedupHs = usBcHs / usPureHs
-        printfn $"  BouncyCastle (Native) : {usBcHs,7:F1} us/op | {opsBcHs,7:F1} handshakes/sec"
-        printfn $"  Speedup (Pure vs BC)  : {speedupHs:F2}x faster\n"
+        printfn $"  Pure F# RFC 4279/5246 : {usPureHs,7:F1} us/op | {opsPureHs,7:F1} handshakes/sec\n"
 
         // --------------------------------------------------------------------
         // [2/5] TLS 7,684-byte Frame Decryption (5,000 iterations)
@@ -679,27 +609,16 @@ module DeviceRunner =
         printfn "[2/5] TLS 7,684-byte Frame Decryption (5,000 iterations):"
         let frame7684 = Array.init 7684 (fun i -> byte (i &&& 0xff))
 
-        let pureDecClient = new TlsClientProtocol()
-        pureDecClient.Connect(TestPskTlsClient(psk))
+        let pureDecClient = new PureTlsPskClient(psk)
         use pureDecServer = new PureFSharpTlsPskTunnel(psk)
 
-        let chDecLen = pureDecClient.GetAvailableOutputBytes()
-        let chDecBuf = Array.zeroCreate<byte> chDecLen
-        pureDecClient.ReadOutput(chDecBuf, 0, chDecLen) |> ignore
-        let shDecBytes = ((pureDecServer :> ITlsPskTunnel).HandleHandshake(chDecBuf) |> Result.defaultWith (fun e -> failwith (string e))).Value
-        pureDecClient.OfferInput(shDecBytes)
+        let chDec = pureDecClient.CreateClientHello()
+        let shDec = ((pureDecServer :> ITlsPskTunnel).HandleHandshake(chDec) |> Result.defaultWith (fun e -> failwith (string e))).Value
+        let cfDec = pureDecClient.ProcessServerHello(shDec)
+        let sfDec = ((pureDecServer :> ITlsPskTunnel).HandleHandshake(cfDec) |> Result.defaultWith (fun e -> failwith (string e))).Value
+        pureDecClient.ProcessServerFinished(sfDec) |> ignore
 
-        let cfDecLen = pureDecClient.GetAvailableOutputBytes()
-        let cfDecBuf = Array.zeroCreate<byte> cfDecLen
-        pureDecClient.ReadOutput(cfDecBuf, 0, cfDecLen) |> ignore
-        let sfDecBytes = ((pureDecServer :> ITlsPskTunnel).HandleHandshake(cfDecBuf) |> Result.defaultWith (fun e -> failwith (string e))).Value
-        pureDecClient.OfferInput(sfDecBytes)
-
-        pureDecClient.WriteApplicationData(frame7684, 0, frame7684.Length)
-        let appDecLen = pureDecClient.GetAvailableOutputBytes()
-        let appDecBuf = Array.zeroCreate<byte> appDecLen
-        pureDecClient.ReadOutput(appDecBuf, 0, appDecLen) |> ignore
-
+        let appDecBuf = pureDecClient.EncryptApplicationData(frame7684)
         let encryptedPayloadForPure = Array.concat [
             [| 0xb2uy; 0x00uy; 0x20uy; 0xd2uy; 0x00uy; 0x00uy; 0x00uy; 0x00uy; 0x00uy |]
             appDecBuf
@@ -714,61 +633,14 @@ module DeviceRunner =
         for _ in 1 .. 5000 do
             pureDecServer.ResetClientSeqNum()
             match (pureDecServer :> ITlsPskTunnel).DecryptApplicationData(encryptedPayloadForPure) with
-            | Ok plain -> ()
+            | Ok _ -> ()
             | Error err -> failwith $"Decryption failed: {err}"
         swDec.Stop()
 
         let usDec = float swDec.ElapsedTicks * 1_000_000.0 / float Stopwatch.Frequency / 5000.0
         let fpsDec = 5000.0 / swDec.Elapsed.TotalSeconds
         let mbsDec = (float (5000L * 7684L) / (1024.0 * 1024.0)) / swDec.Elapsed.TotalSeconds
-        printfn $"  Pure F# Decrypt       : {usDec,7:F1} us/frame | {mbsDec,7:F1} MB/s | {fpsDec,7:F1} frames/sec"
-
-        // Setup BouncyCastle decryption
-        let bcDecClient = new TlsClientProtocol()
-        bcDecClient.Connect(TestPskTlsClient(psk))
-        use bcDecServer = new BouncyCastleTlsPskTunnel(psk)
-        let pumpBc () =
-            let cAvail = bcDecClient.GetAvailableOutputBytes()
-            if cAvail > 0 then
-                let cBuf = Array.zeroCreate<byte> cAvail
-                bcDecClient.ReadOutput(cBuf, 0, cAvail) |> ignore
-                match (bcDecServer :> ITlsPskTunnel).HandleHandshake(cBuf) with
-                | Ok (Some sResp) -> bcDecClient.OfferInput(sResp)
-                | _ -> ()
-        let mutable bcIters = 0
-        while (not bcDecClient.IsConnected || not (bcDecServer :> ITlsPskTunnel).IsHandshakeComplete) && bcIters < 10 do
-            pumpBc ()
-            bcIters <- bcIters + 1
-
-        bcDecClient.WriteApplicationData(frame7684, 0, frame7684.Length)
-        let bcAppDecLen = bcDecClient.GetAvailableOutputBytes()
-        let bcAppDecBuf = Array.zeroCreate<byte> bcAppDecLen
-        bcDecClient.ReadOutput(bcAppDecBuf, 0, bcAppDecLen) |> ignore
-
-        let encryptedPayloadForBc = Array.concat [
-            [| 0xb2uy; 0x00uy; 0x20uy; 0xd2uy; 0x00uy; 0x00uy; 0x00uy; 0x00uy; 0x00uy |]
-            bcAppDecBuf
-        ]
-
-        // Warmup BC
-        for _ in 1 .. 50 do
-            bcDecServer.ResetClientSeqNum()
-            (bcDecServer :> ITlsPskTunnel).DecryptApplicationData(encryptedPayloadForBc) |> ignore
-
-        let swBcDec = Stopwatch.StartNew()
-        for _ in 1 .. 5000 do
-            bcDecServer.ResetClientSeqNum()
-            match (bcDecServer :> ITlsPskTunnel).DecryptApplicationData(encryptedPayloadForBc) with
-            | Ok _ -> ()
-            | Error err -> failwith $"BC Decryption failed: {err}"
-        swBcDec.Stop()
-
-        let usBcDec = float swBcDec.ElapsedTicks * 1_000_000.0 / float Stopwatch.Frequency / 5000.0
-        let fpsBcDec = 5000.0 / swBcDec.Elapsed.TotalSeconds
-        let mbsBcDec = (float (5000L * 7684L) / (1024.0 * 1024.0)) / swBcDec.Elapsed.TotalSeconds
-        let speedupDec = usBcDec / usDec
-        printfn $"  BouncyCastle Decrypt  : {usBcDec,7:F1} us/frame | {mbsBcDec,7:F1} MB/s | {fpsBcDec,7:F1} frames/sec"
-        printfn $"  Speedup (Pure vs BC)  : {speedupDec:F2}x faster\n"
+        printfn $"  Pure F# Decrypt       : {usDec,7:F1} us/frame | {mbsDec,7:F1} MB/s | {fpsDec,7:F1} frames/sec\n"
 
         // --------------------------------------------------------------------
         // [3/5] FrameDecoder 80x64 Unpack & Transpose (20,000 iterations)
@@ -1113,7 +985,6 @@ module Program =
         printfn "  --template-dir <path>     Directory containing enrolled .tgla templates"
         printfn "  --retries <N>             Max verification attempts before failure (default: 3)"
         printfn "  --calibrate-only          Run calibration capture only"
-        printfn "  --tls <pure|bc>           TLS PSK engine (default: pure)"
         printfn "  --vid <hex>               USB Vendor ID (default: 27c6)"
         printfn "  --pid <hex>               USB Product ID (default: 538d)\n"
         printfn "Templates directory resolution:"

@@ -4,10 +4,6 @@ open System
 open System.IO
 open System.Security.Cryptography
 open System.Text
-open Org.BouncyCastle.Tls
-open Org.BouncyCastle.Tls.Crypto.Impl.BC
-open Org.BouncyCastle.Security
-
 // ============================================================================
 // TLS-PSK Tunnel Interface
 // ============================================================================
@@ -23,7 +19,7 @@ type ITlsPskTunnel =
 // Variant 1: 100% Pure F# RFC 4279 / RFC 5246 TLS 1.2 PSK Server
 // ============================================================================
 
-module private PureTlsCrypto =
+module PureTlsCrypto =
 
     let pHash (secret: byte[]) (seed: byte[]) (length: int) : byte[] =
         let result = Array.zeroCreate<byte> length
@@ -368,118 +364,236 @@ type PureFSharpTlsPskTunnel(psk: byte[]) =
                 this.ResetInternal()
 
 // ============================================================================
-// Variant 2: In-Memory TLS 1.2 PSK Server built on Org.BouncyCastle.Tls
+// Pure F# RFC 4279 / RFC 5246 TLS 1.2 PSK Client (for tests, benchmarks & emulation)
 // ============================================================================
 
-type GoodixBcPskTlsServer(psk: byte[]) =
-    inherit PskTlsServer(
-        BcTlsCrypto(SecureRandom()),
-        { new TlsPskIdentityManager with
-            member _.GetHint() = [||]
-            member _.GetPsk(id) = psk
-        }
-    )
-    override this.GetSupportedCipherSuites() =
-        [| CipherSuite.TLS_PSK_WITH_AES_128_CBC_SHA256 |]
-    override this.GetSupportedVersions() =
-        ProtocolVersion.TLSv12.DownTo(ProtocolVersion.TLSv12)
-
-type BouncyCastleTlsPskTunnel(psk: byte[]) =
+type PureTlsPskClient(psk: byte[]) =
     let pskBytes = if isNull psk then Array.zeroCreate 32 else Array.copy psk
-    let mutable serverProtocol: TlsServerProtocol = null
+    let aes = Aes.Create()
+
+    let mutable clientRandom: byte[] = [||]
+    let mutable serverRandom: byte[] = [||]
+    let mutable masterSecret: byte[] = [||]
+    let mutable clientWriteMacKey: byte[] = [||]
+    let mutable serverWriteMacKey: byte[] = [||]
+    let mutable clientWriteKey: byte[] = [||]
+    let mutable serverWriteKey: byte[] = [||]
+    let mutable handshakeMessages = ResizeArray<byte>()
+    let mutable clientSeqNum: uint64 = 0UL
+    let mutable serverSeqNum: uint64 = 0UL
+    let mutable isConnected: bool = false
     let mutable isDisposed: bool = false
 
-    let initServer () =
-        serverProtocol <- new TlsServerProtocol()
-        serverProtocol.Accept(GoodixBcPskTlsServer(pskBytes))
+    new() = new PureTlsPskClient(Array.zeroCreate 32)
 
-    do initServer ()
+    member _.IsConnected = isConnected
 
-    let mutable cachedSeqObj: obj = null
-    let mutable cachedValField: System.Reflection.FieldInfo = null
-
-    new() = new BouncyCastleTlsPskTunnel(Array.zeroCreate 32)
-
-    member this.ResetInternal() =
-        cachedSeqObj <- null
-        cachedValField <- null
-        if not (isNull serverProtocol) then
-            try serverProtocol.Close() with _ -> ()
-        initServer ()
+    member this.Reset() =
+        clientRandom <- [||]
+        serverRandom <- [||]
+        masterSecret <- [||]
+        clientWriteMacKey <- [||]
+        serverWriteMacKey <- [||]
+        clientWriteKey <- [||]
+        serverWriteKey <- [||]
+        handshakeMessages.Clear()
+        clientSeqNum <- 0UL
+        serverSeqNum <- 0UL
+        isConnected <- false
 
     member this.ResetClientSeqNum(?seqNum: uint64) =
-        let target = int64 (defaultArg seqNum 1UL)
-        if isNull cachedValField && not (isNull serverProtocol) then
-            try
-                let flags = System.Reflection.BindingFlags.Instance ||| System.Reflection.BindingFlags.NonPublic
-                let rsField = typeof<TlsProtocol>.GetField("m_recordStream", flags)
-                let rs = rsField.GetValue(serverProtocol)
-                let seqField = rs.GetType().GetField("m_readSeqNo", flags)
-                cachedSeqObj <- seqField.GetValue(rs)
-                cachedValField <- cachedSeqObj.GetType().GetField("m_value", flags)
-            with _ -> ()
-        if not (isNull cachedValField) && not (isNull cachedSeqObj) then
-            cachedValField.SetValue(cachedSeqObj, target)
+        clientSeqNum <- defaultArg seqNum 0UL
 
-    interface ITlsPskTunnel with
-        member this.IsHandshakeComplete =
-            not (isNull serverProtocol) && serverProtocol.IsConnected
+    member this.CreateClientHello(?randomBytes: byte[]) : byte[] =
+        this.Reset()
+        clientRandom <- defaultArg randomBytes (Array.zeroCreate 32)
+        if randomBytes.IsNone then
+            RandomNumberGenerator.Fill(clientRandom.AsSpan())
 
-        member this.Reset() = this.ResetInternal()
+        let chBody = Array.concat [
+            [| 0x03uy; 0x03uy |] // TLS 1.2
+            clientRandom
+            [| 0x00uy |] // Session ID length 0
+            [| 0x00uy; 0x02uy; 0x00uy; 0xaeuy |] // TLS_PSK_WITH_AES_128_CBC_SHA256
+            [| 0x01uy; 0x00uy |] // Compression null
+        ]
+        let chHs = Array.concat [
+            [| 0x01uy; 0x00uy; byte (chBody.Length >>> 8); byte (chBody.Length &&& 0xff) |]
+            chBody
+        ]
+        handshakeMessages.AddRange(chHs)
+        Array.concat [
+            [| 0x16uy; 0x03uy; 0x03uy; byte (chHs.Length >>> 8); byte (chHs.Length &&& 0xff) |]
+            chHs
+        ]
 
-        member this.HandleHandshake(clientRecordBytes: byte[]) : Result<byte[] option, DriverError> =
-            if isNull clientRecordBytes || clientRecordBytes.Length = 0 then
-                Error (TlsHandshakeFailed "Empty handshake record")
+    member this.ProcessServerHello(serverFlightBytes: byte[]) : byte[] =
+        if isNull serverFlightBytes || serverFlightBytes.Length < 9 then
+            failwith "Invalid server flight buffer"
+
+        // Strip outer 4-byte MessagePack 0xb0 header if present
+        let raw =
+            if serverFlightBytes.Length >= 4 && serverFlightBytes.[0] = Protocol.FlagsTransportLayerSecurity && serverFlightBytes.[4] = 0x16uy then
+                Array.sub serverFlightBytes 4 (serverFlightBytes.Length - 4)
             else
-                try
-                    serverProtocol.OfferInput(clientRecordBytes)
-                    let avail = serverProtocol.GetAvailableOutputBytes()
-                    if avail > 0 then
-                        let resp = Array.zeroCreate<byte> avail
-                        serverProtocol.ReadOutput(resp, 0, avail) |> ignore
-                        Ok (Some resp)
-                    else
-                        Ok None
-                with ex ->
-                    Error (TlsHandshakeFailed ex.Message)
+                serverFlightBytes
 
-        member this.DecryptApplicationData(recordBytes: byte[]) : Result<byte[], DriverError> =
-            if isNull recordBytes || recordBytes.Length < 5 then
-                Error (TlsDecryptionFailed "Application data record too short")
+        if raw.[0] <> 0x16uy then
+            failwith $"Expected handshake record (0x16), got 0x{raw.[0]:x2}"
+
+        let recLen = (int raw.[3] <<< 8) ||| int raw.[4]
+        if raw.Length < 5 + recLen then
+            failwith "Truncated ServerHello record"
+
+        // Parse ServerHello at offset 5
+        if raw.[5] <> 0x02uy then
+            failwith $"Expected ServerHello (0x02), got 0x{raw.[5]:x2}"
+        let shLen = (int raw.[6] <<< 16) ||| (int raw.[7] <<< 8) ||| int raw.[8]
+        let shHs = Array.sub raw 5 (4 + shLen)
+        handshakeMessages.AddRange(shHs)
+
+        let shBody = Array.sub raw 9 shLen
+        serverRandom <- Array.sub shBody 2 32
+
+        // Parse ServerHelloDone at offset 5 + 4 + shLen
+        let shdOffset = 5 + 4 + shLen
+        if shdOffset < 5 + recLen then
+            if raw.[shdOffset] <> 0x0euy then
+                failwith $"Expected ServerHelloDone (0x0e), got 0x{raw.[shdOffset]:x2}"
+            let shdLen = (int raw.[shdOffset + 1] <<< 16) ||| (int raw.[shdOffset + 2] <<< 8) ||| int raw.[shdOffset + 3]
+            let shdHs = Array.sub raw shdOffset (4 + shdLen)
+            handshakeMessages.AddRange(shdHs)
+
+        // Derive keys
+        let pskLen = pskBytes.Length
+        let pms = Array.concat [
+            [| 0x00uy; byte pskLen |]
+            Array.zeroCreate pskLen
+            [| 0x00uy; byte pskLen |]
+            pskBytes
+        ]
+        let seed = Array.concat [ clientRandom; serverRandom ]
+        masterSecret <- PureTlsCrypto.prf pms "master secret" seed 48
+
+        let kbSeed = Array.concat [ serverRandom; clientRandom ]
+        let kb = PureTlsCrypto.prf masterSecret "key expansion" kbSeed 96
+        clientWriteMacKey <- Array.sub kb 0 32
+        serverWriteMacKey <- Array.sub kb 32 32
+        clientWriteKey <- Array.sub kb 64 16
+        serverWriteKey <- Array.sub kb 80 16
+
+        // 1. ClientKeyExchange
+        let identity = Encoding.ASCII.GetBytes("Client_identity")
+        let idLen = identity.Length
+        let ckeBody = Array.concat [
+            [| byte (idLen >>> 8); byte (idLen &&& 0xff) |]
+            identity
+        ]
+        let ckeHs = Array.concat [
+            [| 0x10uy; 0x00uy; byte (ckeBody.Length >>> 8); byte (ckeBody.Length &&& 0xff) |]
+            ckeBody
+        ]
+        handshakeMessages.AddRange(ckeHs)
+        let ckeRecord = Array.concat [
+            [| 0x16uy; 0x03uy; 0x03uy; byte (ckeHs.Length >>> 8); byte (ckeHs.Length &&& 0xff) |]
+            ckeHs
+        ]
+
+        // 2. ChangeCipherSpec
+        let ccsRecord = [| 0x14uy; 0x03uy; 0x03uy; 0x00uy; 0x01uy; 0x01uy |]
+
+        // 3. Client Finished
+        let hsHash = PureTlsCrypto.sha256 (handshakeMessages.ToArray())
+        let clientVerifyData = PureTlsCrypto.prf masterSecret "client finished" hsHash 12
+        let clientFinishedContent = Array.concat [
+            [| 0x14uy; 0x00uy; 0x00uy; 0x0cuy |]
+            clientVerifyData
+        ]
+        let mac = PureTlsCrypto.computeMac clientWriteMacKey clientSeqNum 0x16uy clientFinishedContent
+        clientSeqNum <- clientSeqNum + 1UL
+
+        let contentAndMac = Array.concat [ clientFinishedContent; mac ]
+        let rem = contentAndMac.Length % 16
+        let padLen = 16 - rem - 1 + (if rem = 15 then 16 else 0)
+        let padding = Array.create (padLen + 1) (byte padLen)
+        let plain = Array.concat [ contentAndMac; padding ]
+
+        let iv = Array.zeroCreate 16
+        RandomNumberGenerator.Fill(iv.AsSpan())
+        aes.Key <- clientWriteKey
+        let cipher = aes.EncryptCbc(ReadOnlySpan plain, ReadOnlySpan iv, PaddingMode.None)
+        let finPayload = Array.concat [ iv; cipher ]
+        let finRecord = Array.concat [
+            [| 0x16uy; 0x03uy; 0x03uy; byte (finPayload.Length >>> 8); byte (finPayload.Length &&& 0xff) |]
+            finPayload
+        ]
+        handshakeMessages.AddRange(clientFinishedContent)
+
+        Array.concat [ ckeRecord; ccsRecord; finRecord ]
+
+    member this.ProcessServerFinished(serverFlightBytes: byte[]) : bool =
+        if isNull serverFlightBytes || serverFlightBytes.Length < 6 then
+            false
+        else
+            let mutable offset = 0
+            let mutable finPayload = [||]
+            while offset + 5 <= serverFlightBytes.Length do
+                let recType = serverFlightBytes.[offset]
+                let recLen = (int serverFlightBytes.[offset + 3] <<< 8) ||| int serverFlightBytes.[offset + 4]
+                if recType = 0x16uy then
+                    finPayload <- Array.sub serverFlightBytes (offset + 5) recLen
+                offset <- offset + 5 + recLen
+
+            if finPayload.Length < 32 then
+                false
             else
-                try
-                    match PureTlsCrypto.findTlsStartOffset recordBytes with
-                    | None ->
-                        Error (TlsDecryptionFailed "No TLS ApplicationData record found in buffer")
-                    | Some startOffset ->
-                        let data =
-                            if startOffset = 0 then recordBytes
-                            else Array.sub recordBytes startOffset (recordBytes.Length - startOffset)
+                let iv = Array.sub finPayload 0 16
+                let cipher = Array.sub finPayload 16 (finPayload.Length - 16)
+                aes.Key <- serverWriteKey
+                let decrypted = aes.DecryptCbc(ReadOnlySpan cipher, ReadOnlySpan iv, PaddingMode.None)
+                let padLen = int decrypted.[decrypted.Length - 1]
+                let contentAndMacLen = decrypted.Length - 1 - padLen
+                let contentLen = contentAndMacLen - 32
+                if contentLen >= 0 then
+                    let content = Array.sub decrypted 0 contentLen
+                    let mac = Array.sub decrypted contentLen 32
+                    let expectedMac = PureTlsCrypto.computeMac serverWriteMacKey serverSeqNum 0x16uy content
+                    serverSeqNum <- serverSeqNum + 1UL
+                    if mac = expectedMac then
+                        let serverVerifyData = Array.sub content 4 12
+                        let hsHash = PureTlsCrypto.sha256 (handshakeMessages.ToArray())
+                        let expectedVerifyData = PureTlsCrypto.prf masterSecret "server finished" hsHash 12
+                        if serverVerifyData = expectedVerifyData then
+                            isConnected <- true
+                            true
+                        else false
+                    else false
+                else false
 
-                        serverProtocol.OfferInput(data)
-                        let avail = serverProtocol.GetAvailableInputBytes()
-                        if avail > 0 then
-                            let plain = Array.zeroCreate<byte> avail
-                            serverProtocol.ReadApplicationData(plain, 0, avail) |> ignore
-                            Ok plain
-                        else
-                            Error (TlsDecryptionFailed "No decrypted application data available")
-                with ex ->
-                    Error (TlsDecryptionFailed ex.Message)
+    member this.EncryptApplicationData(data: byte[]) : byte[] =
+        if clientWriteKey.Length = 0 then
+            failwith "Cannot encrypt application data before TLS keys are derived"
+        let mac = PureTlsCrypto.computeMac clientWriteMacKey clientSeqNum 0x17uy data
+        clientSeqNum <- clientSeqNum + 1UL
 
-        member this.Dispose() =
+        let contentAndMac = Array.concat [ data; mac ]
+        let rem = contentAndMac.Length % 16
+        let padLen = 16 - rem - 1 + (if rem = 15 then 16 else 0)
+        let padding = Array.create (padLen + 1) (byte padLen)
+        let plain = Array.concat [ contentAndMac; padding ]
+
+        let iv = Array.zeroCreate 16
+        RandomNumberGenerator.Fill(iv.AsSpan())
+        aes.Key <- clientWriteKey
+        let cipher = aes.EncryptCbc(ReadOnlySpan plain, ReadOnlySpan iv, PaddingMode.None)
+        let payload = Array.concat [ iv; cipher ]
+        Array.concat [
+            [| 0x17uy; 0x03uy; 0x03uy; byte (payload.Length >>> 8); byte (payload.Length &&& 0xff) |]
+            payload
+        ]
+
+    interface IDisposable with
+        member _.Dispose() =
             if not isDisposed then
                 isDisposed <- true
-                if not (isNull serverProtocol) then
-                    try serverProtocol.Close() with _ -> ()
-
-// ============================================================================
-// TLS-PSK Client Helper (for unit tests, integration tests & benchmarks)
-// ============================================================================
-
-type TestPskTlsClient(psk: byte[]) =
-    inherit PskTlsClient(BcTlsCrypto(SecureRandom()), BasicTlsPskIdentity("Client_identity", psk))
-    override this.GetSupportedCipherSuites() =
-        [| CipherSuite.TLS_PSK_WITH_AES_128_CBC_SHA256 |]
-    override this.GetSupportedVersions() =
-        ProtocolVersion.TLSv12.DownTo(ProtocolVersion.TLSv12)
+                (aes :> IDisposable).Dispose()

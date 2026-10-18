@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    name: Build, Test & Native AOT Publish
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang zlib1g-dev libusb-1.0-0-dev
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore dependencies
+        run: dotnet restore GoodixFp.sln
+
+      - name: Build solution
+        run: dotnet build GoodixFp.sln --configuration Release --no-restore
+
+      - name: Run unit & integration tests
+        run: dotnet test GoodixFp.sln --configuration Release --no-build --verbosity normal
+
+      - name: Publish Native AOT CLI binary
+        run: dotnet publish src/GoodixFp.Cli/GoodixFp.Cli.fsproj -c Release -r linux-x64
+
+      - name: Upload Native AOT binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: goodix-fp-linux-x64
+          path: src/GoodixFp.Cli/bin/Release/net10.0/linux-x64/publish/GoodixFp.Cli
+          if-no-files-found: error

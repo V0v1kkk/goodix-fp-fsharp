@@ -5,7 +5,7 @@ open System.IO
 open GoodixFp.Core
 
 // ============================================================================
-// Canonical [<Struct>] Single-Case DU Discipline (Vladimir's F# Style Guide)
+// Canonical [<Struct>] Single-Case DU Discipline
 // ============================================================================
 
 [<Struct>]

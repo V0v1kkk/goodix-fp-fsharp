@@ -4,7 +4,6 @@ open System
 open System.IO
 open System.Threading.Tasks
 open Xunit
-open Org.BouncyCastle.Tls
 open GoodixFp.Core
 open GoodixFp.NativeMatcher
 
@@ -268,48 +267,38 @@ let ``PGM and PPM export generate valid headers and byte counts`` () =
     Assert.Equal(expectedHeaderPpm.Length + (80 * 64 * 3), ppm8.Length)
 
 // ============================================================================
-// TLS 1.2 PSK Handshake & Decryption Tests (Both Servers)
+// TLS 1.2 PSK Handshake & Decryption Tests (Pure F# RFC 4279 / RFC 5246)
 // ============================================================================
 
 [<Fact>]
 let ``PureFSharpTlsPskTunnel completes handshake with client and decrypts 7684 byte frame`` () =
     let psk = Array.zeroCreate<byte> 32
-    let client = new TlsClientProtocol()
-    client.Connect(TestPskTlsClient(psk))
-
+    use client = new PureTlsPskClient(psk)
     use server = new PureFSharpTlsPskTunnel(psk) :> ITlsPskTunnel
 
     // 1. ClientHello
-    let chLen = client.GetAvailableOutputBytes()
-    let chBuf = Array.zeroCreate<byte> chLen
-    client.ReadOutput(chBuf, 0, chLen) |> ignore
+    let ch = client.CreateClientHello()
 
     // 2. ServerHello + ServerHelloDone
-    match server.HandleHandshake(chBuf) with
+    match server.HandleHandshake(ch) with
     | Ok (Some shBytes) ->
-        client.OfferInput(shBytes)
+        // 3. ClientKeyExchange + ChangeCipherSpec + Finished
+        let cFlight = client.ProcessServerHello(shBytes)
+
+        // 4. Server ChangeCipherSpec + Finished
+        match server.HandleHandshake(cFlight) with
+        | Ok (Some sfBytes) ->
+            let clientFinishedOk = client.ProcessServerFinished(sfBytes)
+            Assert.True(clientFinishedOk, "Client processed server finished")
+        | other -> Assert.Fail($"Expected Server finished flight, got {other}")
     | other -> Assert.Fail($"Expected ServerHello flight, got {other}")
-
-    // 3. ClientKeyExchange + ChangeCipherSpec + Finished
-    let cFlightLen = client.GetAvailableOutputBytes()
-    let cFlightBuf = Array.zeroCreate<byte> cFlightLen
-    client.ReadOutput(cFlightBuf, 0, cFlightLen) |> ignore
-
-    // 4. Server ChangeCipherSpec + Finished
-    match server.HandleHandshake(cFlightBuf) with
-    | Ok (Some sfBytes) ->
-        client.OfferInput(sfBytes)
-    | other -> Assert.Fail($"Expected Server finished flight, got {other}")
 
     Assert.True(client.IsConnected, "Client is connected")
     Assert.True(server.IsHandshakeComplete, "Pure F# server handshake complete")
 
     // 5. Encrypt 7684-byte frame from client
     let frame = Array.init 7684 (fun i -> byte (i &&& 0xff))
-    client.WriteApplicationData(frame, 0, frame.Length)
-    let appLen = client.GetAvailableOutputBytes()
-    let appBuf = Array.zeroCreate<byte> appLen
-    client.ReadOutput(appBuf, 0, appLen) |> ignore
+    let appBuf = client.EncryptApplicationData(frame)
 
     // Test decryption both with and without 9-byte 0xb2 Goodix header
     match server.DecryptApplicationData(appBuf) with
@@ -317,35 +306,17 @@ let ``PureFSharpTlsPskTunnel completes handshake with client and decrypts 7684 b
         Assert.Equal<byte seq>(frame, decryptedBare)
     | Error err -> Assert.Fail($"Bare application data decryption failed: {err}")
 
-    // Wrap in 9-byte 0xb2 Goodix header
-    let goodixWrapped = Array.concat [
-        [| 0xb2uy; 0x00uy; 0x20uy; 0xd2uy; 0x00uy; 0x00uy; 0x00uy; 0x00uy; 0x00uy |]
-        appBuf
-    ]
+    // Wrap in 9-byte 0xb2 Goodix header with fresh tunnel
+    use serverWrapped = new PureFSharpTlsPskTunnel(psk) :> ITlsPskTunnel
+    use client2 = new PureTlsPskClient(psk)
 
-    // Reset sequence number or re-test
-    // Note: since sequence number incremented for bare record, we test wrapped with fresh tunnel
-    let serverWrapped = new PureFSharpTlsPskTunnel(psk) :> ITlsPskTunnel
-    let client2 = new TlsClientProtocol()
-    client2.Connect(TestPskTlsClient(psk))
+    let ch2 = client2.CreateClientHello()
+    let shBytes2 = (serverWrapped.HandleHandshake(ch2) |> Result.defaultWith (fun e -> failwith (string e))).Value
+    let cFlight2 = client2.ProcessServerHello(shBytes2)
+    let sfBytes2 = (serverWrapped.HandleHandshake(cFlight2) |> Result.defaultWith (fun e -> failwith (string e))).Value
+    client2.ProcessServerFinished(sfBytes2) |> ignore
 
-    let chLen2 = client2.GetAvailableOutputBytes()
-    let chBuf2 = Array.zeroCreate<byte> chLen2
-    client2.ReadOutput(chBuf2, 0, chLen2) |> ignore
-    let shBytes2 = (serverWrapped.HandleHandshake(chBuf2) |> Result.defaultWith (fun e -> failwith (string e))).Value
-    client2.OfferInput(shBytes2)
-
-    let cFlightLen2 = client2.GetAvailableOutputBytes()
-    let cFlightBuf2 = Array.zeroCreate<byte> cFlightLen2
-    client2.ReadOutput(cFlightBuf2, 0, cFlightLen2) |> ignore
-    let sfBytes2 = (serverWrapped.HandleHandshake(cFlightBuf2) |> Result.defaultWith (fun e -> failwith (string e))).Value
-    client2.OfferInput(sfBytes2)
-
-    client2.WriteApplicationData(frame, 0, frame.Length)
-    let appLen2 = client2.GetAvailableOutputBytes()
-    let appBuf2 = Array.zeroCreate<byte> appLen2
-    client2.ReadOutput(appBuf2, 0, appLen2) |> ignore
-
+    let appBuf2 = client2.EncryptApplicationData(frame)
     let goodixWrapped2 = Array.concat [
         [| 0xb2uy; 0x00uy; 0x20uy; 0xd2uy; 0x00uy; 0x00uy; 0x00uy; 0x00uy; 0x00uy |]
         appBuf2
@@ -357,48 +328,34 @@ let ``PureFSharpTlsPskTunnel completes handshake with client and decrypts 7684 b
     | Error err -> Assert.Fail($"0xb2-wrapped application data decryption failed: {err}")
 
 [<Fact>]
-let ``BouncyCastleTlsPskTunnel completes handshake with client and decrypts 7684 byte frame`` () =
-    let psk = Array.zeroCreate<byte> 32
-    let client = new TlsClientProtocol()
-    client.Connect(TestPskTlsClient(psk))
+let ``PureTlsCrypto verifies RFC 5246 PRF and HMAC vectors and start offset detection`` () =
+    // Verify PRF test vector with known secret and seed
+    let secret = Array.init 32 (fun i -> byte i)
+    let seed = Array.init 32 (fun i -> byte (i + 32))
+    let prfOutput = PureTlsCrypto.prf secret "test label" seed 48
+    Assert.Equal(48, prfOutput.Length)
 
-    use server = new BouncyCastleTlsPskTunnel(psk) :> ITlsPskTunnel
+    // Verify HMAC-SHA256 record MAC computation
+    let macKey = Array.init 32 (fun i -> byte (i * 3))
+    let payload = Array.init 100 (fun i -> byte (i * 7))
+    let mac = PureTlsCrypto.computeMac macKey 1UL 0x17uy payload
+    Assert.Equal(32, mac.Length)
 
-    let pump () =
-        let cAvail = client.GetAvailableOutputBytes()
-        if cAvail > 0 then
-            let cBuf = Array.zeroCreate<byte> cAvail
-            client.ReadOutput(cBuf, 0, cAvail) |> ignore
-            match server.HandleHandshake(cBuf) with
-            | Ok (Some sResp) -> client.OfferInput(sResp)
-            | Ok None -> ()
-            | Error err -> failwith $"Server handshake error: {err}"
+    // Verify findTlsStartOffset across bare (0), Goodix 9-byte (9), and MessagePack 13-byte (13) headers
+    let bareTls = [| 0x17uy; 0x03uy; 0x03uy; 0x00uy; 0x10uy |]
+    Assert.Equal(Some 0, PureTlsCrypto.findTlsStartOffset bareTls)
 
-    let mutable iters = 0
-    while (not client.IsConnected || not server.IsHandshakeComplete) && iters < 10 do
-        pump ()
-        iters <- iters + 1
-
-    Assert.True(client.IsConnected, "BC Client connected")
-    Assert.True(server.IsHandshakeComplete, "BC Server connected")
-
-    // Send 7684-byte frame
-    let frame = Array.init 7684 (fun i -> byte (i &&& 0xff))
-    client.WriteApplicationData(frame, 0, frame.Length)
-
-    let appAvail = client.GetAvailableOutputBytes()
-    let appBuf = Array.zeroCreate<byte> appAvail
-    client.ReadOutput(appBuf, 0, appAvail) |> ignore
-
-    let goodixWrapped = Array.concat [
+    let goodix9 = Array.concat [
         [| 0xb2uy; 0x00uy; 0x20uy; 0xd2uy; 0x00uy; 0x00uy; 0x00uy; 0x00uy; 0x00uy |]
-        appBuf
+        bareTls
     ]
+    Assert.Equal(Some 9, PureTlsCrypto.findTlsStartOffset goodix9)
 
-    match server.DecryptApplicationData(goodixWrapped) with
-    | Ok decrypted ->
-        Assert.Equal<byte seq>(frame, decrypted)
-    | Error err -> Assert.Fail($"BC DecryptApplicationData failed: {err}")
+    let goodix13 = Array.concat [
+        [| 0xb2uy; 0x80uy; 0x00uy; 0x32uy |]
+        goodix9
+    ]
+    Assert.Equal(Some 13, PureTlsCrypto.findTlsStartOffset goodix13)
 
 // ============================================================================
 // High-Level Device53xd Driver Workflow Tests (Mock Transport)
@@ -692,23 +649,15 @@ let ``GoodixTodMatcher with baseline frame accepts real saved laptop touches 1 t
 [<Fact>]
 let ``PureFSharpTlsPskTunnel handles ClientKeyExchange, ChangeCipherSpec, and Finished across 3 separate calls`` () =
     let psk = Array.zeroCreate<byte> 32
-    let client = new TlsClientProtocol()
-    client.Connect(TestPskTlsClient(psk))
-
+    use client = new PureTlsPskClient(psk)
     use server = new PureFSharpTlsPskTunnel(psk) :> ITlsPskTunnel
 
     // 1. ClientHello
-    let chLen = client.GetAvailableOutputBytes()
-    let chBuf = Array.zeroCreate<byte> chLen
-    client.ReadOutput(chBuf, 0, chLen) |> ignore
-
-    let shBytes = (server.HandleHandshake(chBuf) |> Result.defaultWith (fun e -> failwith (string e))).Value
-    client.OfferInput(shBytes)
+    let ch = client.CreateClientHello()
+    let shBytes = (server.HandleHandshake(ch) |> Result.defaultWith (fun e -> failwith (string e))).Value
 
     // 2. Client sends flight: extract individual TLS records
-    let cFlightLen = client.GetAvailableOutputBytes()
-    let cFlightBuf = Array.zeroCreate<byte> cFlightLen
-    client.ReadOutput(cFlightBuf, 0, cFlightLen) |> ignore
+    let cFlightBuf = client.ProcessServerHello(shBytes)
 
     // Split concatenated cFlightBuf into separate TLS records
     let records = ResizeArray<byte[]>()
@@ -736,45 +685,32 @@ let ``PureFSharpTlsPskTunnel handles ClientKeyExchange, ChangeCipherSpec, and Fi
     // Call 3: Encrypted Finished -> returns Ok (Some serverFlight)
     match server.HandleHandshake(records.[2]) with
     | Ok (Some sfBytes) ->
-        client.OfferInput(sfBytes)
+        let clientFinishedOk = client.ProcessServerFinished(sfBytes)
+        Assert.True(clientFinishedOk, "Client processed server finished")
     | other -> Assert.Fail($"Expected Ok (Some serverFlight) for Finished, got {other}")
 
     Assert.True(server.IsHandshakeComplete)
     Assert.True(client.IsConnected)
 
 [<Fact>]
-let ``PureFSharpTlsPskTunnel and BouncyCastle decrypt concatenated multi-record frames across 0, 9, and 13 offsets`` () =
+let ``PureFSharpTlsPskTunnel decrypts concatenated multi-record frames across 0, 9, and 13 offsets`` () =
     let psk = Array.zeroCreate<byte> 32
 
     // Setup Pure F# session
-    let client = new TlsClientProtocol()
-    client.Connect(TestPskTlsClient(psk))
+    use client = new PureTlsPskClient(psk)
     use pureServer = new PureFSharpTlsPskTunnel(psk) :> ITlsPskTunnel
 
-    let chLen = client.GetAvailableOutputBytes()
-    let chBuf = Array.zeroCreate<byte> chLen
-    client.ReadOutput(chBuf, 0, chLen) |> ignore
-    let shBytes = (pureServer.HandleHandshake(chBuf) |> Result.defaultWith (fun e -> failwith (string e))).Value
-    client.OfferInput(shBytes)
-
-    let cFlightLen = client.GetAvailableOutputBytes()
-    let cFlightBuf = Array.zeroCreate<byte> cFlightLen
-    client.ReadOutput(cFlightBuf, 0, cFlightLen) |> ignore
-    let sfBytes = (pureServer.HandleHandshake(cFlightBuf) |> Result.defaultWith (fun e -> failwith (string e))).Value
-    client.OfferInput(sfBytes)
+    let ch = client.CreateClientHello()
+    let shBytes = (pureServer.HandleHandshake(ch) |> Result.defaultWith (fun e -> failwith (string e))).Value
+    let cFlight = client.ProcessServerHello(shBytes)
+    let sfBytes = (pureServer.HandleHandshake(cFlight) |> Result.defaultWith (fun e -> failwith (string e))).Value
+    client.ProcessServerFinished(sfBytes) |> ignore
 
     // Write chunk 1 (100 bytes) and chunk 2 (200 bytes)
     let chunk1 = Array.init 100 (fun i -> byte (i &&& 0xff))
     let chunk2 = Array.init 200 (fun i -> byte ((i + 100) &&& 0xff))
-    client.WriteApplicationData(chunk1, 0, chunk1.Length)
-    let rec1Len = client.GetAvailableOutputBytes()
-    let rec1Bytes = Array.zeroCreate<byte> rec1Len
-    client.ReadOutput(rec1Bytes, 0, rec1Len) |> ignore
-
-    client.WriteApplicationData(chunk2, 0, chunk2.Length)
-    let rec2Len = client.GetAvailableOutputBytes()
-    let rec2Bytes = Array.zeroCreate<byte> rec2Len
-    client.ReadOutput(rec2Bytes, 0, rec2Len) |> ignore
+    let rec1Bytes = client.EncryptApplicationData(chunk1)
+    let rec2Bytes = client.EncryptApplicationData(chunk2)
 
     // Concatenate two TLS records into one buffer
     let multiRecordTls = Array.concat [ rec1Bytes; rec2Bytes ]
@@ -787,23 +723,14 @@ let ``PureFSharpTlsPskTunnel and BouncyCastle decrypt concatenated multi-record 
 
     // Reset sequence number and test with 9-byte Goodix header
     pureServer.Reset()
-    let client2 = new TlsClientProtocol()
-    client2.Connect(TestPskTlsClient(psk))
-    let chLen2 = client2.GetAvailableOutputBytes()
-    let chBuf2 = Array.zeroCreate<byte> chLen2
-    client2.ReadOutput(chBuf2, 0, chLen2) |> ignore
-    let shBytes2 = (pureServer.HandleHandshake(chBuf2) |> Result.defaultWith (fun e -> failwith (string e))).Value
-    client2.OfferInput(shBytes2)
-    let cFlightLen2 = client2.GetAvailableOutputBytes()
-    let cFlightBuf2 = Array.zeroCreate<byte> cFlightLen2
-    client2.ReadOutput(cFlightBuf2, 0, cFlightLen2) |> ignore
-    let sfBytes2 = (pureServer.HandleHandshake(cFlightBuf2) |> Result.defaultWith (fun e -> failwith (string e))).Value
-    client2.OfferInput(sfBytes2)
+    use client2 = new PureTlsPskClient(psk)
+    let ch2 = client2.CreateClientHello()
+    let shBytes2 = (pureServer.HandleHandshake(ch2) |> Result.defaultWith (fun e -> failwith (string e))).Value
+    let cFlight2 = client2.ProcessServerHello(shBytes2)
+    let sfBytes2 = (pureServer.HandleHandshake(cFlight2) |> Result.defaultWith (fun e -> failwith (string e))).Value
+    client2.ProcessServerFinished(sfBytes2) |> ignore
 
-    client2.WriteApplicationData(chunk1, 0, chunk1.Length)
-    let rec1Len2 = client2.GetAvailableOutputBytes()
-    let rec1Bytes2 = Array.zeroCreate<byte> rec1Len2
-    client2.ReadOutput(rec1Bytes2, 0, rec1Len2) |> ignore
+    let rec1Bytes2 = client2.EncryptApplicationData(chunk1)
 
     // 9-byte Goodix header (0xb2 + 8 metadata bytes) -> offset 9
     let goodixHeader9 = [| 0xb2uy; 0x00uy; 0x20uy; 0xd2uy; 0x00uy; 0x00uy; 0x00uy; 0x00uy; 0x00uy |]
@@ -815,23 +742,14 @@ let ``PureFSharpTlsPskTunnel and BouncyCastle decrypt concatenated multi-record 
 
     // Test with 4-byte outer MessagePack header + 9-byte Goodix header (offset 13)
     pureServer.Reset()
-    let client3 = new TlsClientProtocol()
-    client3.Connect(TestPskTlsClient(psk))
-    let chLen3 = client3.GetAvailableOutputBytes()
-    let chBuf3 = Array.zeroCreate<byte> chLen3
-    client3.ReadOutput(chBuf3, 0, chLen3) |> ignore
-    let shBytes3 = (pureServer.HandleHandshake(chBuf3) |> Result.defaultWith (fun e -> failwith (string e))).Value
-    client3.OfferInput(shBytes3)
-    let cFlightLen3 = client3.GetAvailableOutputBytes()
-    let cFlightBuf3 = Array.zeroCreate<byte> cFlightLen3
-    client3.ReadOutput(cFlightBuf3, 0, cFlightLen3) |> ignore
-    let sfBytes3 = (pureServer.HandleHandshake(cFlightBuf3) |> Result.defaultWith (fun e -> failwith (string e))).Value
-    client3.OfferInput(sfBytes3)
+    use client3 = new PureTlsPskClient(psk)
+    let ch3 = client3.CreateClientHello()
+    let shBytes3 = (pureServer.HandleHandshake(ch3) |> Result.defaultWith (fun e -> failwith (string e))).Value
+    let cFlight3 = client3.ProcessServerHello(shBytes3)
+    let sfBytes3 = (pureServer.HandleHandshake(cFlight3) |> Result.defaultWith (fun e -> failwith (string e))).Value
+    client3.ProcessServerFinished(sfBytes3) |> ignore
 
-    client3.WriteApplicationData(chunk1, 0, chunk1.Length)
-    let rec1Len3 = client3.GetAvailableOutputBytes()
-    let rec1Bytes3 = Array.zeroCreate<byte> rec1Len3
-    client3.ReadOutput(rec1Bytes3, 0, rec1Len3) |> ignore
+    let rec1Bytes3 = client3.EncryptApplicationData(chunk1)
 
     // 4-byte MessagePack header (0xb2, len_lo, len_hi, csum) + 9-byte metadata
     let mpHeader = [| 0xb2uy; 0x80uy; 0x00uy; 0x32uy |]

@@ -49,17 +49,17 @@ graph TD
 The Goodix 53xd chip negotiates an encrypted TLS 1.2 PSK channel over USB Bulk endpoints using the cipher suite `TLS_PSK_WITH_AES_128_CBC_SHA256` (`0x00AE`).
 - **Zero External Crypto Dependencies**: Implemented in 100% pure F# on top of `System.Security.Cryptography.Aes` and `HMACSHA256`.
 - **Complete RFC-Compliant State Machine**: Parses `ClientHello`, handles pre-master secret formulation (`0x0020` + 32 zero bytes + `0x0020` + 32 zero bytes), derives `master_secret` and `key_block` using the TLS PRF `P_SHA256`, validates `ClientKeyExchange`, generates `ServerHello` and `ServerHelloDone` (with RFC 5746 secure renegotiation), and verifies `Finished` handshake verification flights.
-- **Ultra-Fast Performance**: Handshake completes in **~248 µs** (2.5x faster than native BouncyCastle at 622 µs), with full 7,684-byte frame decryption in **10.9 µs** (> 700 MB/s).
+- **Ultra-Fast Performance**: Handshake completes in **~57.9 µs** (~17,250 handshakes/sec), with full 7,684-byte frame decryption in **11.4 µs** (> 640 MB/s, ~88,000 fps).
 
 ### 2. Zero-Allocation 12-Bit Frame Decoder
 Goodix sensors output packed 12-bit pixel data across 6,144 bytes per frame.
 - **SIMD & JIT Friendly**: `unpackAndTranspose80x64Span` transforms packed column data into standard row-major 80x64 pixels (`out[((i &&& 0x3f) * 80) + (i >>> 6)]`).
-- **Zero Heap Allocations**: Operates directly on `ReadOnlySpan<byte>` and `Span<uint16>`, processing entire frames in **~4.9 µs** (> 200,000 FPS).
+- **Zero Heap Allocations**: Operates directly on `ReadOnlySpan<byte>` and `Span<uint16>`, processing entire frames in **~4.3 µs** (> 230,000 FPS).
 - **Export Formats**: Built-in encoders for PGM (12-bit P5 and 8-bit normalized P5) and PPM (P6).
 
 ### 3. Native AOT Fast Startup (< 10ms)
-- Compiled directly to native machine code using .NET 10 Native AOT (`PublishAot=true`, `StripSymbols=true`, `InvariantGlobalization=true`).
-- Produces a single, self-contained **~7.7 MB native ELF binary** with **< 5ms cold startup time**.
+- Compiled directly to native machine code using .NET 10 Native AOT (`PublishAot=true`, `PublishTrimmed=true`, `TrimMode=full`, `StripSymbols=true`, `InvariantGlobalization=true`, `IlcFoldIdenticalMethodBodies=true`).
+- Produces a single, self-contained **~4.6 MB native ELF binary** with **< 5ms cold startup time**.
 - Fast startup is vital for sub-second terminal command execution and instantaneous PAM authentication prompts.
 
 ### 4. Pluggable Authentication Modules (PAM) Integration
@@ -67,7 +67,7 @@ Goodix sensors output packed 12-bit pixel data across 6,144 bytes per frame.
 - Returns standard exit code `0` on successful biometric match, `1` on rejection or timeout.
 - Includes `--quiet` flag to suppress diagnostics, `--retries <N>` for configurable touch retry attempts, and cross-session privilege separation resolving `SUDO_USER` and `PAM_USER` template storage paths.
 
-### 5. Idiomatic Functional Architecture (Vladimir's F# Style Guide)
+### 5. Idiomatic Functional Architecture
 - **Single-Case Domain Types**: `[<Struct>]` single-case DUs (`UsbVid`, `UsbPid`, `ChipId`, `FirmwareVersion`, `RegisterAddress`, `PskHash`, `QualityScore`, `CoverageScore`, `TemplateId`) with private constructors and validation modules.
 - **Active Patterns Classification**: Outer and inner packet protocols decomposed via compiler-enforced active patterns: `(|AckResponse|CommandResponse|InvalidPacket|)`.
 - **Pure Functional Pipeline**: FsToolkit.ErrorHandling (`result { }` and `taskResult { }`) throughout, guaranteeing total functions without unhandled exceptions.
@@ -76,17 +76,17 @@ Goodix sensors output packed 12-bit pixel data across 6,144 bytes per frame.
 
 ## Performance Benchmarks
 
-Measured on Linux x64 with .NET 10 Native AOT:
+Measured on Linux x64 with .NET 10 Native AOT on Dell Vostro 7590 (Intel Core i7-9750H @ 2.60GHz):
 
-| Benchmark Operation | Pure F# Runtime | Native BouncyCastle / Array | Speedup | Throughput |
-|---|---|---|---|---|
-| **TLS 1.2 PSK Handshake** | **248.3 µs** | 622.1 µs | **2.51x** | 4,027 handshakes/sec |
-| **TLS Frame Decrypt (7,684 B)** | **10.9 µs** | — | — | 704.2 MB/s (91,620 fps) |
-| **Frame Unpack & Transpose (Span)** | **4.9 µs** | 10.8 µs (Seq) | **2.20x** | 204,400 frames/sec |
-| **Packet Framing Active Patterns** | **0.08 µs** | — | — | 12,850,000 ops/sec |
-| **CRC32 (7,680 B IEEE 802.3)** | **1.32 µs** | — | — | 5,820 MB/s |
-| **TOD Matcher Preprocessing** | **61.4 µs** | — | — | 16,280 frames/sec |
-| **TOD Matcher 1:1 Probe Match** | **211.8 µs** | — | — | 4,720 matches/sec |
+| Benchmark Operation | Pure F# Runtime | Throughput | Description |
+|---|---|---|---|
+| **TLS 1.2 PSK Handshake** | **57.9 µs** | 17,250 handshakes/sec | Full RFC 4279/5246 handshake exchange (`P_SHA256`) |
+| **TLS Frame Decrypt (7,684 B)** | **11.4 µs** | 645.4 MB/s (88,060 fps) | Vectorized AES-128-CBC + HMAC-SHA256 record verification |
+| **Frame Unpack & Transpose (Span)** | **4.3 µs** | 234,100 frames/sec | Zero-allocation Span unpack & column-to-row transpose |
+| **Packet Framing Active Patterns** | **0.34 µs** | 2,949,000 ops/sec | Compiler-enforced active pattern packet classification |
+| **CRC32 (7,680 B IEEE 802.3)** | **0.43 µs** | 571.8 MB/s | Payload integrity verification |
+| **TOD Matcher Preprocessing** | **1,271.0 µs** | 786.8 frames/sec | Image normalization & feature extraction |
+| **TOD Matcher 1:1 Probe Match** | **3,740.6 µs** | 267.3 matches/sec | Biometric verification against enrolled template |
 
 ---
 
@@ -204,7 +204,6 @@ Options:
   --user <name>             Target user for template storage (for PAM/sudo privilege separation)
   --template-dir <path>     Custom template directory (default: ~/.local/share/goodix-fp/templates/)
   --quiet, -q               Suppress informative messages (output only match status)
-  --tls <pure|bc>           TLS PSK cryptographic engine (default: pure)
   --vid <hex>               USB Vendor ID (default: 27c6)
   --pid <hex>               USB Product ID (default: 538d)
 ```

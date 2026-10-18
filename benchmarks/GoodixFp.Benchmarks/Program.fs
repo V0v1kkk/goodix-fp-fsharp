@@ -3,64 +3,30 @@ namespace GoodixFp.Benchmarks
 open System
 open BenchmarkDotNet.Attributes
 open BenchmarkDotNet.Running
-open Org.BouncyCastle.Tls
 open GoodixFp.Core
 open GoodixFp.NativeMatcher
 open System.IO
 
 // ============================================================================
-// 1. TLS 1.2 PSK Handshake Benchmark: Pure F# vs BouncyCastle
+// 1. TLS 1.2 PSK Handshake Benchmark: Pure F# RFC 4279 / RFC 5246
 // ============================================================================
 
 [<MemoryDiagnoser>]
 type TlsHandshakeBenchmark() =
     let psk = Array.zeroCreate<byte> 32
 
-    [<Benchmark(Baseline = true)>]
-    member _.PureFSharp_Tls12PskHandshake() : bool =
-        let client = new TlsClientProtocol()
-        client.Connect(TestPskTlsClient(psk))
-
-        let server = new PureFSharpTlsPskTunnel(psk) :> ITlsPskTunnel
-
-        let chLen = client.GetAvailableOutputBytes()
-        let chBuf = Array.zeroCreate<byte> chLen
-        client.ReadOutput(chBuf, 0, chLen) |> ignore
-
-        let shBytes = (server.HandleHandshake(chBuf) |> Result.defaultWith (fun e -> failwith (string e))).Value
-        client.OfferInput(shBytes)
-
-        let cFlightLen = client.GetAvailableOutputBytes()
-        let cFlightBuf = Array.zeroCreate<byte> cFlightLen
-        client.ReadOutput(cFlightBuf, 0, cFlightLen) |> ignore
-
-        let sfBytes = (server.HandleHandshake(cFlightBuf) |> Result.defaultWith (fun e -> failwith (string e))).Value
-        client.OfferInput(sfBytes)
-
-        client.IsConnected && server.IsHandshakeComplete
-
     [<Benchmark>]
-    member _.BouncyCastle_Tls12PskHandshake() : bool =
-        let client = new TlsClientProtocol()
-        client.Connect(TestPskTlsClient(psk))
+    member _.PureFSharp_Tls12PskHandshake() : bool =
+        let client = new PureTlsPskClient(psk)
+        use server = new PureFSharpTlsPskTunnel(psk) :> ITlsPskTunnel
 
-        let server = new BouncyCastleTlsPskTunnel(psk) :> ITlsPskTunnel
+        let ch = client.CreateClientHello()
+        let sh = (server.HandleHandshake(ch) |> Result.defaultWith (fun e -> failwith (string e))).Value
+        let cFlight = client.ProcessServerHello(sh)
+        let sf = (server.HandleHandshake(cFlight) |> Result.defaultWith (fun e -> failwith (string e))).Value
+        let finOk = client.ProcessServerFinished(sf)
 
-        let pump () =
-            let cAvail = client.GetAvailableOutputBytes()
-            if cAvail > 0 then
-                let cBuf = Array.zeroCreate<byte> cAvail
-                client.ReadOutput(cBuf, 0, cAvail) |> ignore
-                match server.HandleHandshake(cBuf) with
-                | Ok (Some sResp) -> client.OfferInput(sResp)
-                | _ -> ()
-
-        let mutable iters = 0
-        while (not client.IsConnected || not server.IsHandshakeComplete) && iters < 10 do
-            pump ()
-            iters <- iters + 1
-
-        client.IsConnected && server.IsHandshakeComplete
+        finOk && client.IsConnected && server.IsHandshakeComplete
 
 // ============================================================================
 // 2. TLS 7,684-byte Application Data Decryption Benchmark
@@ -72,77 +38,29 @@ type TlsDecryptionBenchmark() =
     let frame = Array.init 7684 (fun i -> byte (i &&& 0xff))
 
     let mutable pureServer: PureFSharpTlsPskTunnel = Unchecked.defaultof<_>
-    let mutable pureClient: TlsClientProtocol = Unchecked.defaultof<_>
-
-    let mutable bcServer: BouncyCastleTlsPskTunnel = Unchecked.defaultof<_>
-    let mutable bcClient: TlsClientProtocol = Unchecked.defaultof<_>
-
+    let mutable pureClient: PureTlsPskClient = Unchecked.defaultof<_>
     let mutable encryptedPayloadForPure: byte[] = [||]
-    let mutable encryptedPayloadForBc: byte[] = [||]
 
     [<GlobalSetup>]
     member this.Setup() =
-        // Setup Pure F# session
-        pureClient <- new TlsClientProtocol()
-        pureClient.Connect(TestPskTlsClient(psk))
+        pureClient <- new PureTlsPskClient(psk)
         pureServer <- new PureFSharpTlsPskTunnel(psk)
-        let chLen = pureClient.GetAvailableOutputBytes()
-        let chBuf = Array.zeroCreate<byte> chLen
-        pureClient.ReadOutput(chBuf, 0, chLen) |> ignore
-        let shBytes = ((pureServer :> ITlsPskTunnel).HandleHandshake(chBuf) |> Result.defaultWith (fun e -> failwith (string e))).Value
-        pureClient.OfferInput(shBytes)
-        let cFlightLen = pureClient.GetAvailableOutputBytes()
-        let cFlightBuf = Array.zeroCreate<byte> cFlightLen
-        pureClient.ReadOutput(cFlightBuf, 0, cFlightLen) |> ignore
-        let sfBytes = ((pureServer :> ITlsPskTunnel).HandleHandshake(cFlightBuf) |> Result.defaultWith (fun e -> failwith (string e))).Value
-        pureClient.OfferInput(sfBytes)
+        let ch = pureClient.CreateClientHello()
+        let sh = ((pureServer :> ITlsPskTunnel).HandleHandshake(ch) |> Result.defaultWith (fun e -> failwith (string e))).Value
+        let cFlight = pureClient.ProcessServerHello(sh)
+        let sf = ((pureServer :> ITlsPskTunnel).HandleHandshake(cFlight) |> Result.defaultWith (fun e -> failwith (string e))).Value
+        pureClient.ProcessServerFinished(sf) |> ignore
 
-        pureClient.WriteApplicationData(frame, 0, frame.Length)
-        let appLen = pureClient.GetAvailableOutputBytes()
-        let appBuf = Array.zeroCreate<byte> appLen
-        pureClient.ReadOutput(appBuf, 0, appLen) |> ignore
+        let appBuf = pureClient.EncryptApplicationData(frame)
         encryptedPayloadForPure <- Array.concat [
             [| 0xb2uy; 0x00uy; 0x20uy; 0xd2uy; 0x00uy; 0x00uy; 0x00uy; 0x00uy; 0x00uy |]
             appBuf
         ]
 
-        // Setup BouncyCastle session
-        bcClient <- new TlsClientProtocol()
-        bcClient.Connect(TestPskTlsClient(psk))
-        bcServer <- new BouncyCastleTlsPskTunnel(psk)
-        let pump () =
-            let cAvail = bcClient.GetAvailableOutputBytes()
-            if cAvail > 0 then
-                let cBuf = Array.zeroCreate<byte> cAvail
-                bcClient.ReadOutput(cBuf, 0, cAvail) |> ignore
-                match (bcServer :> ITlsPskTunnel).HandleHandshake(cBuf) with
-                | Ok (Some sResp) -> bcClient.OfferInput(sResp)
-                | _ -> ()
-        let mutable iters = 0
-        while (not bcClient.IsConnected || not (bcServer :> ITlsPskTunnel).IsHandshakeComplete) && iters < 10 do
-            pump ()
-            iters <- iters + 1
-
-        bcClient.WriteApplicationData(frame, 0, frame.Length)
-        let bcAppLen = bcClient.GetAvailableOutputBytes()
-        let bcAppBuf = Array.zeroCreate<byte> bcAppLen
-        bcClient.ReadOutput(bcAppBuf, 0, bcAppLen) |> ignore
-        encryptedPayloadForBc <- Array.concat [
-            [| 0xb2uy; 0x00uy; 0x20uy; 0xd2uy; 0x00uy; 0x00uy; 0x00uy; 0x00uy; 0x00uy |]
-            bcAppBuf
-        ]
-
-    [<Benchmark(Baseline = true)>]
+    [<Benchmark>]
     member _.PureFSharp_Decrypt7684Bytes() : int =
         pureServer.ResetClientSeqNum()
         match (pureServer :> ITlsPskTunnel).DecryptApplicationData(encryptedPayloadForPure) with
-        | Ok plain -> plain.Length
-        | Error _ -> 0
-
-    [<Benchmark>]
-    member _.BouncyCastle_Decrypt7684Bytes() : int =
-        bcServer.ResetClientSeqNum()
-        match (bcServer :> ITlsPskTunnel).DecryptApplicationData(encryptedPayloadForBc) with
         | Ok plain -> plain.Length
         | Error _ -> 0
 
@@ -293,8 +211,7 @@ module Program =
             printfn "Running quick in-process sanity benchmarks for all suites..."
             let hs = TlsHandshakeBenchmark()
             let hsPure = hs.PureFSharp_Tls12PskHandshake()
-            let hsBc = hs.BouncyCastle_Tls12PskHandshake()
-            printfn $"  TLS Handshake Pure F#: {hsPure} | BouncyCastle: {hsBc}"
+            printfn $"  TLS Handshake Pure F#: {hsPure}"
 
             let fd = FrameDecoderBenchmark()
             fd.Setup()
