@@ -252,19 +252,62 @@ type DeviceMethodHandler(deviceSession: DeviceSession, authorizer: IAuthorizer) 
                             context.ReplyError(errName, errMsg)
 
                     | "EnrollStart" ->
-                        context.ReplyError(
-                            FprintConstants.Errors.Internal,
-                            "Enrollment is not supported via fprintd bridge. Use 'goodix-fp enroll <finger>' and import."
-                        )
+                        match deviceSession.ClaimedSender with
+                        | None ->
+                            context.ReplyError(FprintConstants.Errors.ClaimDevice, "Device is not claimed")
+                        | Some s when s.Value <> sender.Value ->
+                            context.ReplyError(FprintConstants.Errors.ClaimDevice, "Device is claimed by another client")
+                        | Some _ ->
+                            let! uidRes = authorizer.GetCallerUidAsync sender
+                            let isRoot = match uidRes with Ok uid -> uid.IsRoot | _ -> false
+                            let! isAuth = authorizer.CheckPolkitAsync(sender, PolkitActions.Enroll)
+                            if not isRoot && not isAuth then
+                                context.ReplyError(FprintConstants.Errors.PermissionDenied, "Not authorized to enroll fingerprints")
+                            else
+                                context.ReplyError(
+                                    FprintConstants.Errors.Internal,
+                                    "Enrollment is not supported via fprintd bridge. Use 'goodix-fp enroll <finger>' and import."
+                                )
 
                     | "EnrollStop" ->
-                        context.ReplyError(FprintConstants.Errors.NoActionInProgress, "No enrollment is in progress")
+                        match deviceSession.ClaimedSender with
+                        | None ->
+                            context.ReplyError(FprintConstants.Errors.ClaimDevice, "Device is not claimed")
+                        | Some s when s.Value <> sender.Value ->
+                            context.ReplyError(FprintConstants.Errors.ClaimDevice, "Device is claimed by another client")
+                        | Some _ ->
+                            context.ReplyError(FprintConstants.Errors.NoActionInProgress, "No enrollment is in progress")
 
-                    | "DeleteEnrolledFingers" | "DeleteEnrolledFingers2" | "DeleteEnrolledFinger" ->
-                        context.ReplyError(
-                            FprintConstants.Errors.PrintsNotDeleted,
-                            "Fingerprint deletion is not supported via D-Bus; manage template files under /var/lib/goodix-fp/templates/ via root."
-                        )
+                    | "DeleteEnrolledFingers" ->
+                        let mutable reader = context.Request.GetBodyReader()
+                        let requestedUser = reader.ReadString()
+                        let! authRes = Authorization.authorizeAccessUser authorizer sender requestedUser
+                        match authRes with
+                        | Error (errName, errMsg) ->
+                            context.ReplyError(errName, errMsg)
+                        | Ok _ ->
+                            context.ReplyError(
+                                FprintConstants.Errors.PrintsNotDeleted,
+                                "Fingerprint deletion is not supported via D-Bus; manage template files under /var/lib/goodix-fp/templates/ via root."
+                            )
+
+                    | "DeleteEnrolledFingers2" | "DeleteEnrolledFinger" ->
+                        match deviceSession.ClaimedSender with
+                        | None ->
+                            context.ReplyError(FprintConstants.Errors.ClaimDevice, "Device is not claimed")
+                        | Some s when s.Value <> sender.Value ->
+                            context.ReplyError(FprintConstants.Errors.ClaimDevice, "Device is claimed by another client")
+                        | Some _ ->
+                            let! uidRes = authorizer.GetCallerUidAsync sender
+                            let isRoot = match uidRes with Ok uid -> uid.IsRoot | _ -> false
+                            let! isAuth = authorizer.CheckPolkitAsync(sender, PolkitActions.Enroll)
+                            if not isRoot && not isAuth then
+                                context.ReplyError(FprintConstants.Errors.PermissionDenied, "Not authorized to delete fingerprints")
+                            else
+                                context.ReplyError(
+                                    FprintConstants.Errors.PrintsNotDeleted,
+                                    "Fingerprint deletion is not supported via D-Bus; manage template files under /var/lib/goodix-fp/templates/ via root."
+                                )
 
                     | _ ->
                         context.ReplyUnknownMethodError()

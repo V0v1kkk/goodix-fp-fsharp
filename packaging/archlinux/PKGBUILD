@@ -75,7 +75,9 @@ package() {
     install -Dm755 "${srcdir}/publish-cli/GoodixFp.Cli" "${pkgdir}/usr/bin/goodix-fp"
 
     # 2. Install Daemon Native AOT binary as /usr/lib/goodix-fp/goodix-fprintd
-    if [[ -f "${srcdir}/publish-daemon/GoodixFp.Daemon" ]]; then
+    if [[ -f "${srcdir}/publish-daemon/goodix-fprintd" ]]; then
+        install -Dm755 "${srcdir}/publish-daemon/goodix-fprintd" "${pkgdir}/usr/lib/goodix-fp/goodix-fprintd"
+    elif [[ -f "${srcdir}/publish-daemon/GoodixFp.Daemon" ]]; then
         install -Dm755 "${srcdir}/publish-daemon/GoodixFp.Daemon" "${pkgdir}/usr/lib/goodix-fp/goodix-fprintd"
     fi
 

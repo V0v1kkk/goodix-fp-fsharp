@@ -533,3 +533,91 @@ let ``Client disconnect on NameOwnerChanged automatically releases claim and can
     Assert.False(session.IsClaimed)
     Assert.Equal(None, session.ClaimedSender)
 }
+
+[<Fact>]
+let ``VerifyStop after verification completed accepts stop and then accepts next VerifyStart cleanly`` () = task {
+    use scope = new TestStateDirScope()
+    let mutable lastStatus = None
+
+    let runner = MockDeviceRunner("no-match") :> IDeviceRunner
+    let session = DeviceSession(
+        runner,
+        ignore,
+        ignore,
+        (fun (st, d) -> lastStatus <- Some (st, d))
+    )
+
+    let client = BusSender.createUnsafe ":1.888"
+    let user = Username.create "frank" |> Result.defaultWith (fun e -> failwith e)
+    let finger = FingerName.create "right-index-finger" |> Result.defaultWith (fun e -> failwith e)
+
+    // 1. Claim device
+    session.Claim(client, user) |> ignore
+
+    // Setup template
+    let tmpFile = Path.Combine(Path.GetTempPath(), "frank_test.tgla")
+    File.WriteAllBytes(tmpFile, createSyntheticTglaBlob TemplateBlob.ExpectedSize)
+    TemplateStore.importTemplate user finger tmpFile |> ignore
+    File.Delete(tmpFile)
+
+    // 2. Start verification attempt 1 (pam_fprintd flow)
+    let startRes1 = session.VerifyStart(client, finger)
+    Assert.True(startRes1 |> Result.isOk)
+
+    // Allow mock runner to complete
+    do! Task.Delay 100
+    Assert.Equal(Some (FprintConstants.VerifyStatuses.NoMatch, true), lastStatus)
+
+    // 3. pam_fprintd calls VerifyStop after done=true
+    let! stopRes = session.VerifyStop(client)
+    Assert.True(stopRes |> Result.isOk)
+
+    // 4. Calling VerifyStop again when already idle must return NoActionInProgress
+    let! stopAgain = session.VerifyStop(client)
+    match stopAgain with
+    | Error (errName, _) -> Assert.Equal(FprintConstants.Errors.NoActionInProgress, errName)
+    | Ok _ -> Assert.Fail("Expected NoActionInProgress on second VerifyStop")
+
+    // 5. Start verification attempt 2 (pam_fprintd retry)
+    let startRes2 = session.VerifyStart(client, finger)
+    Assert.True(startRes2 |> Result.isOk)
+
+    do! Task.Delay 100
+    Assert.Equal(Some (FprintConstants.VerifyStatuses.NoMatch, true), lastStatus)
+
+    // 6. Clean release
+    let! relRes = session.Release(client)
+    Assert.True(relRes |> Result.isOk)
+    Assert.False(session.IsClaimed)
+}
+
+[<Fact>]
+let ``Injected test policy allow-self vs deny-all behaves correctly under test state dir`` () = task {
+    use scope = new TestStateDirScope()
+    // TestStateDirScope sets GOODIX_FPRINTD_STATE_DIR so test policy is honoured
+
+    // 1. Policy allow-self: verify allowed, setusername denied
+    Environment.SetEnvironmentVariable("GOODIX_FPRINTD_TEST_POLICY", "allow-self")
+    let authorizerAllowSelf = MockAuthorizer(1000u, "testuser", Set.empty) :> IAuthorizer
+    let! resVerifyAllowed = Authorization.authorizeVerify authorizerAllowSelf (BusSender.createUnsafe ":1.999")
+    // When authorizer handles polkit directly:
+    // CheckPolkitAsync on mock checks allowedPolkitActions.
+    // For DBusAuthorizer fallback:
+    // Let's verify DBusAuthorizer directly with a disconnected connection
+    let dbusAuthorizer = DBusAuthorizer(null) :> IAuthorizer
+    let! verifyAuth = dbusAuthorizer.CheckPolkitAsync(BusSender.createUnsafe ":1.999", PolkitActions.Verify)
+    Assert.True(verifyAuth)
+
+    let! setuserAuth = dbusAuthorizer.CheckPolkitAsync(BusSender.createUnsafe ":1.999", PolkitActions.SetUsername)
+    Assert.False(setuserAuth)
+
+    let! enrollAuth = dbusAuthorizer.CheckPolkitAsync(BusSender.createUnsafe ":1.999", PolkitActions.Enroll)
+    Assert.False(enrollAuth)
+
+    // 2. Policy deny-all: verify denied
+    Environment.SetEnvironmentVariable("GOODIX_FPRINTD_TEST_POLICY", "deny-all")
+    let! verifyDenied = dbusAuthorizer.CheckPolkitAsync(BusSender.createUnsafe ":1.999", PolkitActions.Verify)
+    Assert.False(verifyDenied)
+
+    Environment.SetEnvironmentVariable("GOODIX_FPRINTD_TEST_POLICY", null)
+}

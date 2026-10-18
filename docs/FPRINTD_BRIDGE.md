@@ -220,3 +220,38 @@ sudo bash scripts/install-fprintd-bridge.sh --remove
    and then imported to `/var/lib/goodix-fp/templates/` via `goodix-fprintd import`.
 3. **Sensor Concurrency**:
    Only one process can access the USB device at a time. If `goodix-fp probe` or `goodix-fp verify` is actively running, D-Bus `Claim` requests return `net.reactivated.Fprint.Error.AlreadyInUse`.
+
+---
+
+## 6. Integration & Real-Finger Testing
+
+### 1. Automated Integration Test Suite (Private D-Bus, Real Hardware)
+To run the automated 13-check integration harness against the real sensor on `vostro-laptop` without touching PAM or the system bus:
+```bash
+./tests/integration/run-bus-tests.sh --remote
+```
+Checks verified:
+- D-Bus Introspection on `/net/reactivated/Fprint/Manager` and `/net/reactivated/Fprint/Device/0`
+- `GetDevices` & `GetDefaultDevice` object paths
+- Device properties (`name`, `scan-type`, `num-enroll-stages`, `finger-present`, `finger-needed`)
+- `ListEnrolledFingers` -> `[right-index-finger]`
+- `Claim` and `Release` lifecycle
+- Concurrent `Claim` -> `AlreadyInUse`
+- Non-claimer `VerifyStop` -> `ClaimDevice` error
+- Privilege separation: `nobody` UID 65534 denied from listing/claiming target user prints
+- `EnrollStart`, `EnrollStop`, `DeleteEnrolledFingers` return proper spec errors
+- `VerifyStart` returns fast (<500ms; typical ~1ms)
+- `VerifyStop` cancellation: sensor sleeps, subsequent `VerifyStart` restarts cleanly
+- Mid-verify client crash (`kill -9`) -> automatic release via `NameOwnerChanged`, reclaimable
+- Overall verification timeout path -> `VerifyStatus` (`done=true`) and clean stop
+
+### 2. Interactive Real-Finger Touch Test (For User on vostro-laptop)
+To verify fingerprint matching and rejection with real fingers:
+```bash
+ssh vostro-laptop
+/tmp/goodix-fp/bus-test/manual-finger-test.sh
+```
+Covers:
+- **Scenario 1**: Touch with enrolled finger (right index) -> `VerifyStatus: verify-match (done=True)`
+- **Scenario 2**: Touch with unenrolled finger -> `VerifyStatus: verify-retry-scan` -> `verify-no-match (done=True)`
+- **Scenario 3**: Start without touching -> `VerifyStop` cancellation -> clean restart -> `VerifyStop`

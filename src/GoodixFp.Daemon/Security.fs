@@ -77,6 +77,39 @@ type IAuthorizer =
 // ============================================================================
 
 type DBusAuthorizer(connection: DBusConnection) =
+    let getTestPolicy () =
+        let isTestOverride =
+            not (String.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("GOODIX_FPRINTD_STATE_DIR")))
+        if isTestOverride then
+            let p = Environment.GetEnvironmentVariable("GOODIX_FPRINTD_TEST_POLICY")
+            if String.IsNullOrWhiteSpace p then None
+            else Some (p.Trim().ToLowerInvariant())
+        else
+            None
+
+    let checkNameHasOwner (name: string) : Task<bool> = task {
+        if obj.ReferenceEquals(connection, null) then return false
+        else
+            try
+                let mutable writer = connection.GetMessageWriter()
+                writer.WriteMethodCallHeader(
+                    destination = "org.freedesktop.DBus",
+                    path = "/org/freedesktop/DBus",
+                    ``interface`` = "org.freedesktop.DBus",
+                    ``member`` = "NameHasOwner",
+                    signature = "s"
+                )
+                writer.WriteString(name)
+                let msg = writer.CreateMessage()
+                let! hasOwner = connection.CallMethodAsync(msg, (fun reply _ ->
+                    let mutable reader = reply.GetBodyReader()
+                    reader.ReadBool()
+                ), null)
+                return hasOwner
+            with _ ->
+                return false
+    }
+
     interface IAuthorizer with
         member this.GetCallerUidAsync(sender: BusSender) : Task<Result<CallerUid, string>> = task {
             try
@@ -111,50 +144,66 @@ type DBusAuthorizer(connection: DBusConnection) =
         }
 
         member this.CheckPolkitAsync(sender: BusSender, actionId: string) : Task<bool> = task {
-            try
-                let mutable writer = connection.GetMessageWriter()
-                writer.WriteMethodCallHeader(
-                    destination = "org.freedesktop.PolicyKit1",
-                    path = "/org/freedesktop/PolicyKit1/Authority",
-                    ``interface`` = "org.freedesktop.PolicyKit1.Authority",
-                    ``member`` = "CheckAuthorization",
-                    signature = "(sa{sv})sa{ss}us"
-                )
+            let! hasPolkit = checkNameHasOwner "org.freedesktop.PolicyKit1"
+            if not hasPolkit then
+                // Polkit is unreachable (e.g. private test system bus without polkitd).
+                // Test policy injection is HONOURED ONLY if GOODIX_FPRINTD_STATE_DIR is also set.
+                // In production (systemd unit with strict hardening and stock state dir), testPolicy is always None.
+                match getTestPolicy () with
+                | Some "allow-self" ->
+                    // Allows verifying own prints (matching stock allow_active=yes),
+                    // but administrative operations (setusername, enroll) remain denied.
+                    return actionId = PolkitActions.Verify
+                | Some "deny-all" ->
+                    return false
+                | _ ->
+                    // Fail closed in production or when test policy is unspecified
+                    return false
+            else
+                try
+                    let mutable writer = connection.GetMessageWriter()
+                    writer.WriteMethodCallHeader(
+                        destination = "org.freedesktop.PolicyKit1",
+                        path = "/org/freedesktop/PolicyKit1/Authority",
+                        ``interface`` = "org.freedesktop.PolicyKit1.Authority",
+                        ``member`` = "CheckAuthorization",
+                        signature = "(sa{sv})sa{ss}us"
+                    )
 
-                // 1. Subject struct (sa{sv})
-                writer.WriteStructureStart()
-                writer.WriteString("system-bus-name")
-                let dictStart = writer.WriteDictionaryStart()
-                writer.WriteDictionaryEntryStart()
-                writer.WriteString("name")
-                writer.WriteVariantString(sender.Value)
-                writer.WriteDictionaryEnd(dictStart)
+                    // 1. Subject struct (sa{sv})
+                    writer.WriteStructureStart()
+                    writer.WriteString("system-bus-name")
+                    let dictStart = writer.WriteDictionaryStart()
+                    writer.WriteDictionaryEntryStart()
+                    writer.WriteString("name")
+                    writer.WriteVariantString(sender.Value)
+                    writer.WriteDictionaryEnd(dictStart)
 
-                // 2. Action ID
-                writer.WriteString(actionId)
+                    // 2. Action ID
+                    writer.WriteString(actionId)
 
-                // 3. Details dictionary a{ss} (empty)
-                let detailsStart = writer.WriteDictionaryStart()
-                writer.WriteDictionaryEnd(detailsStart)
+                    // 3. Details dictionary a{ss} (empty)
+                    let detailsStart = writer.WriteDictionaryStart()
+                    writer.WriteDictionaryEnd(detailsStart)
 
-                // 4. Flags (0 = no interaction)
-                writer.WriteUInt32(0u)
+                    // 4. Flags (0 = no interaction)
+                    writer.WriteUInt32(0u)
 
-                // 5. Cancellation ID string (empty)
-                writer.WriteString("")
+                    // 5. Cancellation ID string (empty)
+                    writer.WriteString("")
 
-                let msg = writer.CreateMessage()
+                    let msg = writer.CreateMessage()
 
-                let! (isAuthorized, _) = connection.CallMethodAsync(msg, (fun reply _ ->
-                    let mutable reader = reply.GetBodyReader()
-                    reader.AlignStruct()
-                    let auth = reader.ReadBool()
-                    let challenge = reader.ReadBool()
-                    (auth, challenge)
-                ), null)
-                return isAuthorized
-            with _ ->
-                return false
+                    let! (isAuthorized, _) = connection.CallMethodAsync(msg, (fun reply _ ->
+                        let mutable reader = reply.GetBodyReader()
+                        reader.AlignStruct()
+                        let auth = reader.ReadBool()
+                        let challenge = reader.ReadBool()
+                        (auth, challenge)
+                    ), null)
+                    return isAuthorized
+                with _ ->
+                    return false
         }
 
 // ============================================================================

@@ -197,9 +197,12 @@ find_binary() {
     fi
 
     local candidates=(
+        "${REPO_ROOT}/src/GoodixFp.Daemon/bin/Release/net10.0/linux-x64/publish/goodix-fprintd"
         "${REPO_ROOT}/src/GoodixFp.Daemon/bin/Release/net10.0/linux-x64/publish/GoodixFp.Daemon"
+        "${REPO_ROOT}/publish-daemon/goodix-fprintd"
         "${REPO_ROOT}/publish-daemon/GoodixFp.Daemon"
         "${REPO_ROOT}/goodix-fprintd"
+        "${REPO_ROOT}/src/GoodixFp.Daemon/bin/Release/net10.0/goodix-fprintd"
         "${REPO_ROOT}/src/GoodixFp.Daemon/bin/Release/net10.0/GoodixFp.Daemon"
         "${DEST_BIN}"
     )
