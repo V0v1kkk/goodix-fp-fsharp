@@ -628,6 +628,63 @@ let ``GoodixTodMatcher E2E enrolls 12 samples, exports 65KB TGLA template, match
             // Impostor successfully rejected
             ()
 
+[<Fact>]
+let ``GoodixTodMatcher with baseline frame accepts real saved laptop touches 1 to 12 and identifies touch 14`` () =
+    let home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)
+    let candidatePaths = [
+        Path.Combine(home, ".local/share/goodix-fp/libgoodix_tod_53xc.so")
+        "/tmp/libgoodix_standalone.so"
+    ]
+    let libPathOpt = candidatePaths |> List.tryFind File.Exists
+    let calibPgmPath = "/tmp/goodix-fp/calib-baseline16.pgm"
+    let touch1PgmPath = "/tmp/goodix-fp/enroll-sample1-touch1-raw16.pgm"
+
+    match libPathOpt with
+    | Some pathStr when File.Exists calibPgmPath && File.Exists touch1PgmPath ->
+        let libPath = LibraryPath.create pathStr |> Result.defaultWith (fun e -> failwith (string e))
+        let calibBytes = File.ReadAllBytes calibPgmPath
+        let calibPixels = FrameDecoder.fromPgm12Bit calibBytes
+        let baseline = RawFrame12Bit.create calibPixels |> Result.toOption
+        use matcher = GoodixTodMatcher.Create(customPath = libPath.Value, ?baseline = baseline) |> Result.defaultWith (fun e -> failwith $"Failed to create matcher: {e}")
+
+        // Start enrollment
+        match matcher.StartEnroll() with
+        | Error err -> Assert.Fail($"StartEnroll failed: {err}")
+        | Ok () -> ()
+
+        // Merge all available touches 1..12
+        for i in 1 .. 12 do
+            let touchPath = $"/tmp/goodix-fp/enroll-sample1-touch{i}-raw16.pgm"
+            if File.Exists touchPath then
+                let touchBytes = File.ReadAllBytes touchPath
+                let touchPixels = FrameDecoder.fromPgm12Bit touchBytes
+                match matcher.MergeSample(touchPixels) with
+                | Error err -> Assert.Fail($"MergeSample touch {i} failed: {err}")
+                | Ok progress ->
+                    Assert.Equal(i, progress)
+
+        let fingerId = FingerId.create "finger1" |> Result.defaultWith (fun e -> failwith (string e))
+        let templateBlob =
+            match matcher.CommitTemplate(fingerId) with
+            | Error err -> failwith $"CommitTemplate failed: {err}"
+            | Ok blob ->
+                Assert.True(blob.Length > 50000, $"Expected template size > 50000, got {blob.Length}")
+                blob
+
+        let enrolledTemplates = [ (fingerId, templateBlob) ]
+
+        // Test touch 14 if exists
+        let touch14Path = "/tmp/goodix-fp/enroll-sample1-touch14-raw16.pgm"
+        if File.Exists touch14Path then
+            let t14Bytes = File.ReadAllBytes touch14Path
+            let t14Pixels = FrameDecoder.fromPgm12Bit t14Bytes
+            match matcher.IdentifyProbe(t14Pixels, enrolledTemplates) with
+            | Error err -> Assert.Fail($"IdentifyProbe failed: {err}")
+            | Ok None -> Assert.Fail("Expected touch 14 to match enrolled template")
+            | Ok (Some matchedId) ->
+                Assert.Equal("finger1", matchedId.Value)
+    | _ -> ()
+
 // ============================================================================
 // Multi-record flights & TLS Decryption Offset Tests
 // ============================================================================

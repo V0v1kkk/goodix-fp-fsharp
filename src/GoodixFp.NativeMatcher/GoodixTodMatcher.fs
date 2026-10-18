@@ -141,11 +141,7 @@ type GoodixTodMatcher(nativeFunctions: NativeFunctions, baselineFrame: RawFrame1
     member this.PreprocessNative(raw: RawFrame12Bit) : Result<PreprocessedFrame, DriverError> =
         lock syncLock (fun () ->
             try
-                let rawPixels =
-                    match baselineFrame with
-                    | Some b when b.Pixels.Length = raw.Pixels.Length ->
-                        Array.init raw.Pixels.Length (fun i -> uint16 (max 0 (int raw.Pixels.[i] - int b.Pixels.[i])))
-                    | _ -> raw.Pixels
+                let rawPixels = raw.Pixels
                 let bData = Array.zeroCreate<byte> PreprocessedFrame.BDataSize
                 let enhBuf = Array.zeroCreate<byte> PreprocessedFrame.PixelCount
                 let inStruct = Array.zeroCreate<byte> 0x40
@@ -194,16 +190,16 @@ type GoodixTodMatcher(nativeFunctions: NativeFunctions, baselineFrame: RawFrame1
                     else
                         let (qCalc, cCalc) = GoodixTodMatcher.ComputeQualityAndCoverage rawPixels
                         let q =
-                            if qualCov.[1] > 0 then QualityScore.createUnsafe (Math.Clamp(qualCov.[1], 25, 100))
-                            elif qualCov.[0] > 0 then QualityScore.createUnsafe (Math.Clamp(qualCov.[0], 25, 100))
+                            if qualCov.[0] > 0 then QualityScore.createUnsafe (Math.Clamp(qualCov.[0], 25, 100))
+                            elif qualCov.[1] > 0 then QualityScore.createUnsafe (Math.Clamp(qualCov.[1], 25, 100))
                             else QualityScore.createUnsafe (Math.Clamp(qCalc.Value, 25, 100))
                         let c =
-                            if qualCov.[0] > 0 then CoverageScore.createUnsafe (Math.Clamp(qualCov.[0], 25, 100))
-                            elif qualCov.[1] > 0 then CoverageScore.createUnsafe (Math.Clamp(qualCov.[1], 25, 100))
+                            if qualCov.[1] > 0 then CoverageScore.createUnsafe (Math.Clamp(qualCov.[1], 25, 100))
+                            elif qualCov.[0] > 0 then CoverageScore.createUnsafe (Math.Clamp(qualCov.[0], 25, 100))
                             else CoverageScore.createUnsafe (Math.Clamp(cCalc.Value, 25, 100))
                         if Environment.GetEnvironmentVariable("GOODIX_DEBUG") = "1" then
                             eprintfn $"[DEBUG][Preprocess] qualCov=[{qualCov.[0]}, {qualCov.[1]}], qCalc={qCalc.Value}, cCalc={cCalc.Value} -> final Q={q.Value}, C={c.Value}"
-                        PreprocessedFrame.createWithTrailerAndSubtracted enhBuf bData outStruct q c rawPixels
+                        PreprocessedFrame.createWithTrailer enhBuf bData outStruct q c
                 finally
                     rawHandle.Free()
                     bDataHandle.Free()
@@ -287,7 +283,7 @@ type GoodixTodMatcher(nativeFunctions: NativeFunctions, baselineFrame: RawFrame1
     member this.MergeSample(rawPixels: uint16[]) : Result<int, DriverError> =
         result {
             let! prep = this.Preprocess(rawPixels)
-            return! this.MergeSample(prep.SubtractedPixels, prep.NormalizedPixels, prep.Quality, prep.Coverage, prep.BData, prep.OutStruct)
+            return! this.MergeSample(rawPixels, prep.NormalizedPixels, prep.Quality, prep.Coverage, prep.BData, prep.OutStruct)
         }
 
     member this.CommitTemplate(?fingerId: FingerId) : Result<TemplateBlob, DriverError> =
@@ -377,7 +373,7 @@ type GoodixTodMatcher(nativeFunctions: NativeFunctions, baselineFrame: RawFrame1
             let mutable matchedFinger = None
             for (fid, blob) in templates do
                 if matchedFinger.IsNone then
-                    let! (matched, _) = this.IdentifyProbe(prep.SubtractedPixels, prep.NormalizedPixels, blob.Value, q, c, prep.BData, prep.OutStruct)
+                    let! (matched, _) = this.IdentifyProbe(rawPixels, prep.NormalizedPixels, blob.Value, q, c, prep.BData, prep.OutStruct)
                     if matched then
                         matchedFinger <- Some fid
             return matchedFinger
