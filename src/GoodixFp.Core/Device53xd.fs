@@ -654,8 +654,9 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
     // Workflow 4: Wait for Finger Down Event
     // ------------------------------------------------------------------------
 
-    member this.WaitForFingerDown(?timeoutMs: int) : Task<Result<unit, DriverError>> = taskResult {
+    member this.WaitForFingerDown(?timeoutMs: int, ?cancellationToken: System.Threading.CancellationToken) : Task<Result<unit, DriverError>> = taskResult {
         let timeout = defaultArg timeoutMs 10000
+        let ct = defaultArg cancellationToken System.Threading.CancellationToken.None
 
         let otp =
             match currentOtp with
@@ -686,7 +687,32 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
         // 2. Send 0x32 with reply = true and wait for touch event
         let fdtDownWait = Array.concat [| [| 0x8cuy; 0x01uy |]; dacBytes; downThresholds; [| 0x01uy |] |]
         do! this.SendAndExpectAck(Protocol.packSwitchToFdtDown fdtDownWait, Protocol.CommandMcuSwitchToFdtDown)
-        let! downPayload = this.ReadCommandResponse(Protocol.CommandMcuSwitchToFdtDown, timeout)
+
+        let slice = 250
+        let mutable elapsed = 0
+        let mutable downPayloadOpt = None
+        let mutable lastErr = None
+
+        while downPayloadOpt.IsNone && elapsed < timeout && not ct.IsCancellationRequested do
+            match this.ReadCommandResponse(Protocol.CommandMcuSwitchToFdtDown, slice) with
+            | Ok payload ->
+                downPayloadOpt <- Some payload
+            | Error (Timeout _) | Error (UsbError (_, -7)) ->
+                elapsed <- elapsed + slice
+            | Error err ->
+                lastErr <- Some err
+                elapsed <- timeout
+
+        let! downPayload =
+            if ct.IsCancellationRequested then
+                Error (Timeout "WaitForFingerDown cancelled")
+            else
+                match downPayloadOpt with
+                | Some p -> Ok p
+                | None ->
+                    match lastErr with
+                    | Some err -> Error err
+                    | None -> Error (Timeout $"WaitForFingerDown timed out after {timeout} ms")
 
         // 3. Extract FDT baseline up data if present in payload (offset 2..3: touch_flag, offset 4..19: 16 bytes = 8 words)
         if downPayload.Length >= 20 then
@@ -808,8 +834,9 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
     /// baseline idle tolerance (requiring 2 consecutive clear samples).
     /// Pure 0x36 polling exactly mirrors fdt-monitor and avoids leftover 0x34 arming.
     /// Re-arms the MCU to sleep mode afterwards.
-    member this.WaitForFingerUpRobust(?timeoutMs: int, ?onStillHolding: unit -> unit) : Task<Result<unit, DriverError>> = task {
+    member this.WaitForFingerUpRobust(?timeoutMs: int, ?onStillHolding: unit -> unit, ?cancellationToken: System.Threading.CancellationToken) : Task<Result<unit, DriverError>> = task {
         let totalTimeout = defaultArg timeoutMs 15000
+        let ct = defaultArg cancellationToken System.Threading.CancellationToken.None
         let sw = Stopwatch.StartNew()
         let isGoodixDebug =
             let v = Environment.GetEnvironmentVariable("GOODIX_DEBUG")
@@ -837,7 +864,7 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
         let mutable lastHintTime = sw.ElapsedMilliseconds
         let mutable finished = false
 
-        while not finished && sw.ElapsedMilliseconds < int64 totalTimeout do
+        while not finished && sw.ElapsedMilliseconds < int64 totalTimeout && not ct.IsCancellationRequested do
             let! pollRes = this.ReadFdtManual(timeoutMs = 1000)
             match pollRes with
             | Ok sample ->
@@ -872,13 +899,15 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
                 transport.DrainBuffer(50)
                 consecutiveClear <- 0
 
-            if not finished then
+            if not finished && not ct.IsCancellationRequested then
                 do! Task.Delay 50
 
         if finished then
             let _ = this.SendAndExpectAck(Protocol.packSwitchToSleepMode(), Protocol.CommandMcuSwitchToSleepMode)
             transport.DrainBuffer(50)
             return Ok ()
+        elif ct.IsCancellationRequested then
+            return Error (Timeout "WaitForFingerUp cancelled")
         else
             return Error (Timeout $"Finger was not lifted within {totalTimeout} ms")
     }

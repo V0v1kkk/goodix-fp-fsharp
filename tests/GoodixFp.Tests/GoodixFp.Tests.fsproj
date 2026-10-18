@@ -8,6 +8,7 @@
 
   <ItemGroup>
     <Compile Include="Tests.fs" />
+    <Compile Include="DaemonTests.fs" />
   </ItemGroup>
 
   <ItemGroup>
@@ -21,6 +22,7 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\GoodixFp.Core\GoodixFp.Core.fsproj" />
     <ProjectReference Include="..\..\src\GoodixFp.NativeMatcher\GoodixFp.NativeMatcher.fsproj" />
+    <ProjectReference Include="..\..\src\GoodixFp.Daemon\GoodixFp.Daemon.fsproj" />
   </ItemGroup>
 
 </Project>
