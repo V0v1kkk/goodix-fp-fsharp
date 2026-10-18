@@ -518,14 +518,19 @@ module DeviceRunner =
                             printfn "[*] Touch sensor to verify..."
                             Console.Out.Flush()
 
-                        let rec verifyLoop (attempt: int) : Task<int> = task {
+                        let mutable attempt = 1
+                        let mutable finished = false
+                        let mutable exitCode = 1
+
+                        while not finished do
                             let! downRes = dev.WaitForFingerDown(timeoutMs = 15000)
                             match downRes with
                             | Error _ ->
                                 if not opts.Quiet then
                                     eprintfn "[!] Verification timed out waiting for touch."
                                 let! _ = dev.Sleep()
-                                return 1
+                                exitCode <- 1
+                                finished <- true
                             | Ok () ->
                                 if not opts.Quiet then
                                     printfn "[*] Finger detected. Capturing probe..."
@@ -536,34 +541,37 @@ module DeviceRunner =
                                     if not opts.Quiet then
                                         eprintfn $"[!] Frame capture failed: {err}"
                                     let! _ = dev.Sleep()
-                                    return 1
+                                    exitCode <- 1
+                                    finished <- true
                                 | Ok frame ->
                                     match matcher.IdentifyProbe(frame.Pixels, templates) with
                                     | Error err ->
                                         if not opts.Quiet then
                                             eprintfn $"[!] Identification failed: {err}"
                                         let! _ = dev.Sleep()
-                                        return 1
+                                        exitCode <- 1
+                                        finished <- true
                                     | Ok (Some matchedFid) ->
                                         if not opts.Quiet then
                                             printfn $"[+] MATCH VERIFIED: {matchedFid.Value}"
                                         let! _ = dev.Sleep()
-                                        return 0 // Exit code 0 for PAM success
+                                        exitCode <- 0 // Exit code 0 for PAM success
+                                        finished <- true
                                     | Ok None ->
                                         if attempt < maxRetries then
                                             if not opts.Quiet then
                                                 printfn $"[-] Touch not recognized (attempt {attempt}/{maxRetries}). Please place finger firmly on sensor again..."
                                                 Console.Out.Flush()
                                             let! _ = dev.WaitForFingerUpRobust(timeoutMs = 10000)
-                                            return! verifyLoop (attempt + 1)
+                                            attempt <- attempt + 1
                                         else
                                             if not opts.Quiet then
                                                 printfn $"[-] Verification failed: no matching finger after {maxRetries} attempts (Access Denied)"
                                             let! _ = dev.Sleep()
-                                            return 1 // Exit code 1 for PAM failure
-                        }
+                                            exitCode <- 1 // Exit code 1 for PAM failure
+                                            finished <- true
 
-                        return! verifyLoop 1
+                        return exitCode
                     })
             })
 
