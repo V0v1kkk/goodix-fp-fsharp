@@ -2,13 +2,14 @@
 pkgname=goodix-fp
 pkgver=1.0.0
 pkgrel=1
-pkgdesc="Production-grade pure F# Linux driver and matcher CLI for Goodix 53xc/53xd fingerprint sensors"
+pkgdesc="Production-grade pure F# Linux driver, matcher CLI, and fprintd bridge daemon for Goodix 53xc/53xd fingerprint sensors"
 arch=('x86_64')
 url="https://github.com/v-san/goodix-fp-fsharp"
 license=('MIT')
 depends=(
     'glibc'
     'libusb'
+    'fprintd'
 )
 makedepends=(
     'dotnet-sdk>=10.0'
@@ -20,9 +21,11 @@ optdepends=(
 options=(!strip)
 source=(
     '70-goodix-fp.rules'
+    '10-goodix-fsharp.conf'
 )
 sha256sums=(
     '49cb269d28077e41b9dc0b79095b11b0dd4294682d31e137e05e77226eac0e00'
+    'a97b6caa5854bed52affbefe106f08bbe821978c16e17b5dbcc80d0fa29067f7'
 )
 
 _get_repo_root() {
@@ -48,22 +51,49 @@ build() {
         -c Release \
         -r linux-x64 \
         --self-contained \
-        -o "${srcdir}/publish"
+        -o "${srcdir}/publish-cli"
+
+    # Build GoodixFp.Daemon Native AOT binary (fprintd bridge service)
+    # Assumes project exists; guarded so build gracefully handles separate subagent staging
+    if [[ -f "${repo_root}/src/GoodixFp.Daemon/GoodixFp.Daemon.fsproj" ]]; then
+        echo "==> Building GoodixFp.Daemon Native AOT binary..."
+        dotnet publish "${repo_root}/src/GoodixFp.Daemon/GoodixFp.Daemon.fsproj" \
+            -c Release \
+            -r linux-x64 \
+            --self-contained \
+            -o "${srcdir}/publish-daemon"
+    else
+        echo "==> Notice: src/GoodixFp.Daemon/GoodixFp.Daemon.fsproj not present in current tree, skipping daemon build."
+    fi
 }
 
 package() {
     local repo_root
     repo_root="$(_get_repo_root)"
 
-    # 1. Install Native AOT binary as /usr/bin/goodix-fp
-    install -Dm755 "${srcdir}/publish/GoodixFp.Cli" "${pkgdir}/usr/bin/goodix-fp"
+    # 1. Install CLI Native AOT binary as /usr/bin/goodix-fp
+    install -Dm755 "${srcdir}/publish-cli/GoodixFp.Cli" "${pkgdir}/usr/bin/goodix-fp"
 
-    # 2. Install udev rules to /usr/lib/udev/rules.d/70-goodix-fp.rules
+    # 2. Install Daemon Native AOT binary as /usr/lib/goodix-fp/goodix-fprintd
+    if [[ -f "${srcdir}/publish-daemon/GoodixFp.Daemon" ]]; then
+        install -Dm755 "${srcdir}/publish-daemon/GoodixFp.Daemon" "${pkgdir}/usr/lib/goodix-fp/goodix-fprintd"
+    fi
+
+    # 3. Install systemd drop-in override for stock fprintd.service
+    # In Arch packages, package-provided drop-ins belong in /usr/lib/systemd/system/<unit>.d/
+    # This is pacman-tracked, preserves /etc for the sysadmin, and cleanly redirects fprintd.service.
+    local dropin_src="${srcdir}/10-goodix-fsharp.conf"
+    if [[ ! -f "${dropin_src}" ]]; then
+        dropin_src="${repo_root}/packaging/fprintd/10-goodix-fsharp.conf"
+    fi
+    install -Dm644 "${dropin_src}" "${pkgdir}/usr/lib/systemd/system/fprintd.service.d/10-goodix-fsharp.conf"
+
+    # 4. Install udev rules to /usr/lib/udev/rules.d/70-goodix-fp.rules
     install -Dm644 "${srcdir}/70-goodix-fp.rules" "${pkgdir}/usr/lib/udev/rules.d/70-goodix-fp.rules"
 
-    # 3. Install license
+    # 5. Install license
     install -Dm644 "${repo_root}/LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
 
-    # 4. Install documentation
+    # 6. Install documentation
     install -Dm644 "${repo_root}/README.md" "${pkgdir}/usr/share/doc/${pkgname}/README.md"
 }
