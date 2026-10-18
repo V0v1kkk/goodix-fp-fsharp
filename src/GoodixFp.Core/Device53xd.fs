@@ -1,6 +1,7 @@
 namespace GoodixFp.Core
 
 open System
+open System.Diagnostics
 open System.Threading.Tasks
 open FsToolkit.ErrorHandling
 
@@ -59,6 +60,7 @@ module FdtCalculations =
                 0x92uy; 0x92uy; 0x88uy; 0x88uy
             |]
         else
+            let effectiveFlag = if touchFlag = 0us then 0x00FFus else touchFlag
             let upBase = Array.zeroCreate<byte> 16
             for i in 0 .. 7 do
                 let w = uint16 fdtData.[2 * i] ||| (uint16 fdtData.[2 * i + 1] <<< 8)
@@ -68,7 +70,7 @@ module FdtCalculations =
                 upBase.[2 * i + 1] <- byte upVal
 
             for i in 0 .. 7 do
-                if (touchFlag &&& (1us <<< i)) = 0us then
+                if (effectiveFlag &&& (1us <<< i)) = 0us then
                     let untVal = (if diffVal <> 0 then diffVal - 2 else 0x13) &&& 0xff
                     upBase.[2 * i] <- 0x80uy
                     upBase.[2 * i + 1] <- byte untVal
@@ -84,6 +86,7 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
     let mutable baselineFrame: RawFrame12Bit option = None
     let mutable lastFdtUpBase: byte[] option = None
     let mutable currentFdtDownBase: byte[] option = None
+    let mutable currentFdtIdle: uint16[] option = None
 
     new(transport: IUsbTransport) =
         new Goodix53xdDevice(transport, new PureFSharpTlsPskTunnel())
@@ -94,6 +97,7 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
     member this.BaselineFrame = baselineFrame
     member this.LastFdtUpBase = lastFdtUpBase
     member this.CurrentFdtDownBase = currentFdtDownBase
+    member this.CurrentFdtIdle = currentFdtIdle
 
     // ------------------------------------------------------------------------
     // Low-Level Packet Exchange Helpers
@@ -476,6 +480,8 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
         let! fdtResp0 = this.ReadCommandResponse(Protocol.CommandMcuSwitchToFdtMode, 2000)
         if fdtResp0.Length >= 20 && currentFdtDownBase.IsNone then
             let rawFdt = Array.sub fdtResp0 4 16
+            let idleWords = [| for i in 0 .. 7 -> uint16 rawFdt.[2 * i] ||| (uint16 rawFdt.[2 * i + 1] <<< 8) |]
+            currentFdtIdle <- Some idleWords
             let downBase = FdtCalculations.calcFdtDownBase rawFdt
             currentFdtDownBase <- Some downBase
 
@@ -537,6 +543,8 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
         let! fdtResp = this.ReadCommandResponse(Protocol.CommandMcuSwitchToFdtMode, 2000)
         if fdtResp.Length >= 20 then
             let rawFdt = Array.sub fdtResp 4 16
+            let idleWords = [| for i in 0 .. 7 -> uint16 rawFdt.[2 * i] ||| (uint16 rawFdt.[2 * i + 1] <<< 8) |]
+            currentFdtIdle <- Some idleWords
             let downBase = FdtCalculations.calcFdtDownBase rawFdt
             currentFdtDownBase <- Some downBase
 
@@ -648,8 +656,37 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
     }
 
     // ------------------------------------------------------------------------
-    // Workflow 6: Wait for Finger Up Event
+    // Workflow 6: FDT Manual Reading & Finger Up Detection
     // ------------------------------------------------------------------------
+
+    /// Performs an on-demand manual FDT reading (0x36) and returns the 8 decoded 16-bit FDT words.
+    member this.ReadFdtManual(?timeoutMs: int) : Task<Result<uint16[], DriverError>> = taskResult {
+        let timeout = defaultArg timeoutMs 2000
+        let otp =
+            match currentOtp with
+            | Some o -> o
+            | None -> { Raw = Array.zeroCreate 64; DacH = 0x28uy; DacL = 0x24uy; FdtDac = [| 0x91uy; 0x8buy; 0x96uy; 0x91uy |] }
+
+        let dacBytes = [|
+            otp.FdtDac.[0]; 0x01uy
+            otp.FdtDac.[1]; 0x01uy
+            otp.FdtDac.[2]; 0x01uy
+            otp.FdtDac.[3]; 0x01uy
+        |]
+        let zeros16 = Array.zeroCreate<byte> 16
+        let fdt0dNoReply = Array.concat [| [| 0x0duy; 0x01uy |]; dacBytes; zeros16; [| 0x00uy |] |]
+        do! this.SendAndExpectAck(Protocol.packSwitchToFdtMode fdt0dNoReply, Protocol.CommandMcuSwitchToFdtMode, timeoutMs = timeout)
+
+        let fdt0dWait = Array.concat [| [| 0x0duy; 0x01uy |]; dacBytes; zeros16; [| 0x01uy |] |]
+        do! this.SendAndExpectAck(Protocol.packSwitchToFdtMode fdt0dWait, Protocol.CommandMcuSwitchToFdtMode, timeoutMs = timeout)
+        let! fdtResp = this.ReadCommandResponse(Protocol.CommandMcuSwitchToFdtMode, timeoutMs = timeout)
+        if fdtResp.Length >= 20 then
+            let rawFdt = Array.sub fdtResp 4 16
+            let words = [| for i in 0 .. 7 -> uint16 rawFdt.[2 * i] ||| (uint16 rawFdt.[2 * i + 1] <<< 8) |]
+            return words
+        else
+            return! Error (ProtocolError $"FDT manual response too short ({fdtResp.Length} bytes)")
+    }
 
     member this.WaitForFingerUp(?timeoutMs: int) : Task<Result<unit, DriverError>> = taskResult {
         let timeout = defaultArg timeoutMs 5000
@@ -675,15 +712,99 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
                     0x92uy; 0x92uy; 0x88uy; 0x88uy
                 |]
 
+        // Mode byte 0x0e from libfprint-tod-goodix-53xc FpMcuSwitchToFdtUp / SwitchToFdtUp
         // 1. Send 0x34 with reply = false
-        let fdtUpNoReply = Array.concat [| [| 0x8euy; 0x01uy |]; dacBytes; upThresholds; [| 0x00uy |] |]
-        do! this.SendAndExpectAck(Protocol.packSwitchToFdtUp fdtUpNoReply, Protocol.CommandMcuSwitchToFdtUp)
+        let fdtUpNoReply = Array.concat [| [| 0x0euy; 0x01uy |]; dacBytes; upThresholds; [| 0x00uy |] |]
+        do! this.SendAndExpectAck(Protocol.packSwitchToFdtUp fdtUpNoReply, Protocol.CommandMcuSwitchToFdtUp, timeoutMs = 2000)
 
         // 2. Send 0x34 with reply = true and wait for finger lift event
-        let fdtUpWait = Array.concat [| [| 0x8euy; 0x01uy |]; dacBytes; upThresholds; [| 0x01uy |] |]
-        do! this.SendAndExpectAck(Protocol.packSwitchToFdtUp fdtUpWait, Protocol.CommandMcuSwitchToFdtUp)
-        let! _ = this.ReadCommandResponse(Protocol.CommandMcuSwitchToFdtUp, timeout)
+        let fdtUpWait = Array.concat [| [| 0x0euy; 0x01uy |]; dacBytes; upThresholds; [| 0x01uy |] |]
+        do! this.SendAndExpectAck(Protocol.packSwitchToFdtUp fdtUpWait, Protocol.CommandMcuSwitchToFdtUp, timeoutMs = 2000)
+        let! _ = this.ReadCommandResponse(Protocol.CommandMcuSwitchToFdtUp, timeoutMs = timeout)
         return ()
+    }
+
+    /// Robust finger-up detection: tries hardware 0x34 event with a short timeout,
+    /// then falls back to polling FDT manual mode (0x36) until FDT values return to
+    /// baseline idle tolerance (requiring 2 consecutive clear samples).
+    /// Re-arms the MCU to sleep mode afterwards.
+    member this.WaitForFingerUpRobust(?timeoutMs: int, ?onStillHolding: unit -> unit) : Task<Result<unit, DriverError>> = task {
+        let totalTimeout = defaultArg timeoutMs 15000
+        let sw = Stopwatch.StartNew()
+
+        // 1. First try hardware 0x34 event with short timeout (1000ms)
+        let! hwFired = task {
+            let! hwRes = this.WaitForFingerUp(timeoutMs = 1000)
+            match hwRes with
+            | Ok () ->
+                let _ = this.SendAndExpectAck(Protocol.packSwitchToSleepMode(), Protocol.CommandMcuSwitchToSleepMode)
+                transport.DrainBuffer()
+                return true
+            | Error _ ->
+                transport.DrainBuffer()
+                return false
+        }
+
+        if hwFired then
+            return Ok ()
+        else
+
+        // 2. Fall back to polling FDT manual reading (0x36)
+        let! idle = task {
+            match currentFdtIdle with
+            | Some id -> return id
+            | None ->
+                let! sRes = this.ReadFdtManual(timeoutMs = 1000)
+                match sRes with
+                | Ok s ->
+                    currentFdtIdle <- Some s
+                    return s
+                | Error _ -> return Array.create 8 290us
+        }
+
+        let isSampleClear (sample: uint16[]) : bool =
+            if sample.Length < 8 then false
+            else
+                let mutable clear = true
+                for i in 0 .. 7 do
+                    let diff = abs (int sample.[i] - int idle.[i])
+                    let downDelta = int idle.[i] - (int idle.[i] >>> 1)
+                    let tol = max 15 (downDelta / 3)
+                    if diff > tol then
+                        clear <- false
+                clear
+
+        let mutable consecutiveClear = 0
+        let mutable lastHintTime = sw.ElapsedMilliseconds
+        let mutable finished = false
+
+        while not finished && sw.ElapsedMilliseconds < int64 totalTimeout do
+            let! pollRes = this.ReadFdtManual(timeoutMs = 1000)
+            match pollRes with
+            | Ok sample ->
+                if isSampleClear sample then
+                    consecutiveClear <- consecutiveClear + 1
+                    if consecutiveClear >= 2 then
+                        finished <- true
+                else
+                    consecutiveClear <- 0
+                    if sw.ElapsedMilliseconds - lastHintTime >= 3000L then
+                        lastHintTime <- sw.ElapsedMilliseconds
+                        match onStillHolding with
+                        | Some cb -> cb ()
+                        | None -> ()
+            | Error _ ->
+                transport.DrainBuffer()
+
+            if not finished then
+                do! Task.Delay 100
+
+        if finished then
+            let _ = this.SendAndExpectAck(Protocol.packSwitchToSleepMode(), Protocol.CommandMcuSwitchToSleepMode)
+            transport.DrainBuffer()
+            return Ok ()
+        else
+            return Error (Timeout $"Finger was not lifted within {totalTimeout} ms")
     }
 
     // ------------------------------------------------------------------------

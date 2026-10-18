@@ -405,10 +405,11 @@ let ``BouncyCastleTlsPskTunnel completes handshake with client and decrypts 7684
 // ============================================================================
 
 type MockUsbTransport() =
-    let responses = System.Collections.Generic.Queue<byte[]>()
+    let responses = System.Collections.Generic.Queue<Result<byte[], DriverError>>()
     let written = ResizeArray<byte[]>()
 
-    member _.EnqueueResponse(data: byte[]) = responses.Enqueue(data)
+    member _.EnqueueResponse(data: byte[]) = responses.Enqueue(Ok data)
+    member _.EnqueueError(err: DriverError) = responses.Enqueue(Error err)
     member _.WrittenPackets = written.ToArray()
 
     interface IUsbTransport with
@@ -417,7 +418,7 @@ type MockUsbTransport() =
             Ok ()
         member _.Read(length, timeoutMs) =
             if responses.Count > 0 then
-                Ok (responses.Dequeue())
+                responses.Dequeue()
             else
                 Error (Timeout "Mock transport queue empty")
         member _.DrainBuffer(?timeoutMs: int) = ()
@@ -1110,6 +1111,111 @@ let ``FdtCalculations calcFdtUpBase returns fallback for null or short input`` (
 
     let fallbackShort = FdtCalculations.calcFdtUpBase 0x00FFus [| 0x01uy; 0x02uy |] None
     Assert.Equal(16, fallbackShort.Length)
+
+[<Fact>]
+let ``FdtCalculations calcFdtUpBase treats touchFlag 0 as all areas touched`` () =
+    let rawFdt = [|
+        0x22uy; 0x01uy; 0x24uy; 0x01uy; 0x16uy; 0x01uy; 0x16uy; 0x01uy
+        0x2cuy; 0x01uy; 0x2cuy; 0x01uy; 0x22uy; 0x01uy; 0x22uy; 0x01uy
+    |]
+    let upBaseZeroFlag = FdtCalculations.calcFdtUpBase 0x0000us rawFdt (Some 0x15s)
+    Assert.Equal<byte seq>(
+        [|
+            0x80uy; 0xa6uy
+            0x80uy; 0xa7uy
+            0x80uy; 0xa0uy
+            0x80uy; 0xa0uy
+            0x80uy; 0xabuy
+            0x80uy; 0xabuy
+            0x80uy; 0xa6uy
+            0x80uy; 0xa6uy
+        |],
+        upBaseZeroFlag
+    )
+
+[<Fact>]
+let ``Goodix53xdDevice ReadFdtManual sends mode 0x0d and returns decoded 8 words`` () =
+    task {
+        let mockTransport = new MockUsbTransport()
+
+        // 1. ACK for fdt0dNoReply
+        let ack0 = Protocol.encodeMessagePack Protocol.FlagsMessageProtocol (Protocol.encodeMessageProtocol Protocol.CommandAck [| Protocol.CommandMcuSwitchToFdtMode; 0x03uy |] true)
+        mockTransport.EnqueueResponse(ack0)
+
+        // 2. ACK for fdt0dWait
+        let ack1 = Protocol.encodeMessagePack Protocol.FlagsMessageProtocol (Protocol.encodeMessageProtocol Protocol.CommandAck [| Protocol.CommandMcuSwitchToFdtMode; 0x03uy |] true)
+        mockTransport.EnqueueResponse(ack1)
+
+        // 3. Response for fdt0dWait: 20 bytes (4 header + 16 data)
+        let respPayload = Array.zeroCreate<byte> 20
+        let testWords = [| 290us; 292us; 278us; 278us; 300us; 300us; 290us; 290us |]
+        for i in 0 .. 7 do
+            respPayload.[4 + 2 * i] <- byte (testWords.[i] &&& 0xffus)
+            respPayload.[4 + 2 * i + 1] <- byte (testWords.[i] >>> 8)
+
+        let respPack = Protocol.encodeMessagePack Protocol.FlagsMessageProtocol (Protocol.encodeMessageProtocol Protocol.CommandMcuSwitchToFdtMode respPayload true)
+        mockTransport.EnqueueResponse(respPack)
+
+        use dev = new Goodix53xdDevice(mockTransport)
+        let! wordsRes = dev.ReadFdtManual()
+        match wordsRes with
+        | Ok words ->
+            Assert.Equal<uint16 seq>(testWords, words)
+        | Error err -> Assert.Fail($"ReadFdtManual failed: {err}")
+    }
+
+[<Fact>]
+let ``Goodix53xdDevice WaitForFingerUpRobust falls back to FDT manual polling on 0x34 timeout`` () =
+    task {
+        let mockTransport = new MockUsbTransport()
+
+        // 1. WaitForFingerUp: ACK for fdtUpNoReply (0x34)
+        let ackUp0 = Protocol.encodeMessagePack Protocol.FlagsMessageProtocol (Protocol.encodeMessageProtocol Protocol.CommandAck [| Protocol.CommandMcuSwitchToFdtUp; 0x03uy |] true)
+        mockTransport.EnqueueResponse(ackUp0)
+
+        // 2. WaitForFingerUp: ACK for fdtUpWait (0x34)
+        let ackUp1 = Protocol.encodeMessagePack Protocol.FlagsMessageProtocol (Protocol.encodeMessageProtocol Protocol.CommandAck [| Protocol.CommandMcuSwitchToFdtUp; 0x03uy |] true)
+        mockTransport.EnqueueResponse(ackUp1)
+
+        // 3. WaitForFingerUp: 0x34 timeout (simulating hardware failing to fire 0x34)
+        mockTransport.EnqueueError(Timeout "Hardware 0x34 event timed out")
+
+        // 3. Fallback poll 1: ReadFdtManual
+        let ackMode0 = Protocol.encodeMessagePack Protocol.FlagsMessageProtocol (Protocol.encodeMessageProtocol Protocol.CommandAck [| Protocol.CommandMcuSwitchToFdtMode; 0x03uy |] true)
+        let ackMode1 = Protocol.encodeMessagePack Protocol.FlagsMessageProtocol (Protocol.encodeMessageProtocol Protocol.CommandAck [| Protocol.CommandMcuSwitchToFdtMode; 0x03uy |] true)
+
+        let respPayload1 = Array.zeroCreate<byte> 20
+        let clearWords1 = [| 290us; 290us; 278us; 278us; 300us; 300us; 290us; 290us |]
+        for i in 0 .. 7 do
+            respPayload1.[4 + 2 * i] <- byte (clearWords1.[i] &&& 0xffus)
+            respPayload1.[4 + 2 * i + 1] <- byte (clearWords1.[i] >>> 8)
+        let respPack1 = Protocol.encodeMessagePack Protocol.FlagsMessageProtocol (Protocol.encodeMessageProtocol Protocol.CommandMcuSwitchToFdtMode respPayload1 true)
+
+        // 3. Fallback poll: baseline read
+        mockTransport.EnqueueResponse(ackMode0)
+        mockTransport.EnqueueResponse(ackMode1)
+        mockTransport.EnqueueResponse(respPack1)
+
+        // 4. Fallback poll 1: ReadFdtManual (consecutive clear sample 1)
+        mockTransport.EnqueueResponse(ackMode0)
+        mockTransport.EnqueueResponse(ackMode1)
+        mockTransport.EnqueueResponse(respPack1)
+
+        // 5. Fallback poll 2: ReadFdtManual (consecutive clear sample 2)
+        mockTransport.EnqueueResponse(ackMode0)
+        mockTransport.EnqueueResponse(ackMode1)
+        mockTransport.EnqueueResponse(respPack1)
+
+        // 6. Sleep command ACK (0x60)
+        let ackSleep = Protocol.encodeMessagePack Protocol.FlagsMessageProtocol (Protocol.encodeMessageProtocol Protocol.CommandAck [| Protocol.CommandMcuSwitchToSleepMode; 0x03uy |] true)
+        mockTransport.EnqueueResponse(ackSleep)
+
+        use dev = new Goodix53xdDevice(mockTransport)
+        let! upRes = dev.WaitForFingerUpRobust(timeoutMs = 5000)
+        match upRes with
+        | Ok () -> ()
+        | Error err -> Assert.Fail($"WaitForFingerUpRobust failed: {err}")
+    }
 
 
 

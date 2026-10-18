@@ -53,6 +53,7 @@ type CliOptions = {
     Command: string
     FingerName: string option
     Prefix: string option
+    Seconds: int option
     UseBouncyCastle: bool
     Vid: uint16
     Pid: uint16
@@ -64,6 +65,7 @@ module CommandLine =
         Command = "help"
         FingerName = None
         Prefix = None
+        Seconds = None
         UseBouncyCastle = false
         Vid = 0x27c6us
         Pid = 0x538dus
@@ -100,6 +102,13 @@ module CommandLine =
             Error "The 'enroll' command requires a finger name, e.g. 'goodix-fp enroll index_right'"
         | "verify" :: rest ->
             parseOptions rest { opts with Command = "verify" }
+        | "fdt-monitor" :: secStr :: rest when not (secStr.StartsWith("-")) ->
+            let sec = match Int32.TryParse secStr with true, s when s > 0 -> s | _ -> 10
+            parseOptions rest { opts with Command = "fdt-monitor"; Seconds = Some sec }
+        | "fdt-monitor" :: rest ->
+            parseOptions rest { opts with Command = "fdt-monitor"; Seconds = Some 10 }
+        | "fdt-up-test" :: rest ->
+            parseOptions rest { opts with Command = "fdt-up-test" }
         | "test-merge" :: raw :: rest ->
             let (calib, remaining) =
                 match rest with
@@ -411,18 +420,18 @@ module DeviceRunner =
                                     else
                                         printf "Lift finger... "
                                         Console.Out.Flush()
+                                        let onHolding () =
+                                            printf "(still holding, please lift)... "
+                                            Console.Out.Flush()
+
                                         let mutable fingerLifted = false
-                                        while not fingerLifted && not failure do
-                                            let! upRes = dev.WaitForFingerUp(timeoutMs = 5000)
-                                            match upRes with
-                                            | Ok () ->
-                                                fingerLifted <- true
-                                            | Error (UsbError (_, -7)) ->
-                                                printf "(still holding, please lift)... "
-                                                Console.Out.Flush()
-                                            | Error err ->
-                                                eprintfn $"\n[!] Finger up detection failed: {err}"
-                                                failure <- true
+                                        let! upRes = dev.WaitForFingerUpRobust(timeoutMs = 20000, onStillHolding = onHolding)
+                                        match upRes with
+                                        | Ok () ->
+                                            fingerLifted <- true
+                                        | Error err ->
+                                            eprintfn $"\n[!] Finger up detection failed: {err}"
+                                            failure <- true
 
                                         if fingerLifted then
                                             printfn "OK"
@@ -500,7 +509,7 @@ module DeviceRunner =
                             eprintfn $"[!] Frame capture failed: {err}"
                             return 1
                         | Ok frame ->
-                            let! _ = dev.WaitForFingerUp(timeoutMs = 3000)
+                            let! _ = dev.WaitForFingerUpRobust(timeoutMs = 10000)
                             let! _ = dev.Sleep()
 
                             return! withMatcher dev.BaselineFrame (fun matcher -> task {
@@ -851,6 +860,85 @@ module DeviceRunner =
                 })
         }
 
+    let runFdtMonitor (opts: CliOptions) : Task<int> =
+        let seconds = defaultArg opts.Seconds 10
+        withDevice opts (fun dev -> task {
+            printfn "[*] Activating Goodix session..."
+            let! actRes = dev.ActivateSession()
+            match actRes with
+            | Error err ->
+                eprintfn $"[!] Session activation failed: {err}"
+                return 1
+            | Ok _ ->
+                let! idle = task {
+                    match dev.CurrentFdtIdle with
+                    | Some id -> return id
+                    | None ->
+                        let! sRes = dev.ReadFdtManual()
+                        match sRes with
+                        | Ok s -> return s
+                        | Error _ -> return Array.zeroCreate 8
+                }
+
+                let idleStr = idle |> Array.map (fun v -> (int v).ToString().PadLeft(4)) |> String.concat " "
+                printfn $"[*] FDT Monitor active for {seconds}s (idle baseline: [ {idleStr} ])"
+                printfn "[*] Format: [timestamp] FDT: [ 8x raw values ] | delta: [ 8x signed diff vs idle ]"
+                Console.Out.Flush()
+
+                let sw = Stopwatch.StartNew()
+                let totalMs = int64 seconds * 1000L
+
+                while sw.ElapsedMilliseconds < totalMs do
+                    let! readRes = dev.ReadFdtManual()
+                    match readRes with
+                    | Ok fdt ->
+                        let fdtStr = fdt |> Array.map (fun v -> (int v).ToString().PadLeft(4)) |> String.concat " "
+                        let deltaStr =
+                            Array.map2 (fun curr baseVal ->
+                                let diff = int curr - int baseVal
+                                let sign = if diff >= 0 then "+" else ""
+                                (sign + diff.ToString()).PadLeft(5)
+                            ) fdt idle
+                            |> String.concat " "
+                        let elapsedSec = float sw.ElapsedMilliseconds / 1000.0
+                        let secStr = elapsedSec.ToString("F1").PadLeft(5)
+                        printfn $"[{secStr}s] FDT: [ {fdtStr} ] | delta: [ {deltaStr} ]"
+                        Console.Out.Flush()
+                    | Error err ->
+                        eprintfn $"[!] ReadFdtManual failed: {err}"
+
+                    do! Task.Delay 300
+
+                printfn "[*] Monitoring complete. Putting device to sleep..."
+                let! _ = dev.Sleep()
+                return 0
+        })
+
+    let runFdtUpTest (opts: CliOptions) : Task<int> =
+        withDevice opts (fun dev -> task {
+            printfn "[*] Activating session..."
+            let! actRes = dev.ActivateSession()
+            match actRes with
+            | Error err ->
+                eprintfn $"[!] Activation failed: {err}"
+                return 1
+            | Ok _ ->
+                printfn "[*] Testing WaitForFingerUpRobust with NO finger on sensor..."
+                Console.Out.Flush()
+                let sw = Stopwatch.StartNew()
+                let! upRes = dev.WaitForFingerUpRobust(timeoutMs = 5000)
+                sw.Stop()
+                match upRes with
+                | Ok () ->
+                    printfn $"[+] WaitForFingerUpRobust returned OK in {sw.ElapsedMilliseconds} ms (< 2000 ms target)"
+                    let! _ = dev.Sleep()
+                    return 0
+                | Error err ->
+                    eprintfn $"[!] WaitForFingerUpRobust failed: {err}"
+                    let! _ = dev.Sleep()
+                    return 1
+        })
+
 module Program =
 
     let printHelp () =
@@ -865,6 +953,8 @@ module Program =
         printfn "  capture [prefix]          Capture baseline & frame, export PGM images"
         printfn "  enroll <finger-name>      12-touch interactive enrollment loop"
         printfn "  verify                    Verify finger against enrolled templates (PAM)"
+        printfn "  fdt-monitor [sec]         Monitor live FDT 8-channel readings and delta (default: 10s)"
+        printfn "  fdt-up-test               Test WaitForFingerUpRobust response time with no finger"
         printfn "  benchmark                 Run Native AOT performance benchmark suite"
         printfn "  test-merge <raw> [calib]  Test offline preprocessing & sample merging"
         printfn "  help                      Show this help message\n"
@@ -904,6 +994,10 @@ module Program =
                 (DeviceRunner.runEnroll opts name).GetAwaiter().GetResult()
             | "verify" ->
                 (DeviceRunner.runVerify opts).GetAwaiter().GetResult()
+            | "fdt-monitor" ->
+                (DeviceRunner.runFdtMonitor opts).GetAwaiter().GetResult()
+            | "fdt-up-test" ->
+                (DeviceRunner.runFdtUpTest opts).GetAwaiter().GetResult()
             | "benchmark" ->
                 (DeviceRunner.runBenchmark ()).GetAwaiter().GetResult()
             | "test-merge" ->
