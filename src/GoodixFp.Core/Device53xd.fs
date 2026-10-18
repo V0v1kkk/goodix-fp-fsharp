@@ -36,6 +36,44 @@ module FdtCalculations =
                 downBase.[2 * i + 1] <- byte (wShift &&& 0xff)
             downBase
 
+    /// Computes FDT up base from 16 bytes (8 uint16 little-endian words) of MCU touch readings,
+    /// touchFlag, and optional diff.
+    /// Matches MilanFSerCalcFdtUpBase from libfprint-tod-goodix-53xc:
+    /// Loop 1: For each word w at index i (0..7):
+    ///   val = (w >>> 1) + diff  (default diff is 0x15)
+    ///   upBase.[2*i] <- 0x80uy
+    ///   upBase.[2*i + 1] <- byte (val &&& 0xff)
+    /// Loop 2: For each bit i (0..7) in touchFlag:
+    ///   if (touchFlag &&& (1us <<< i)) = 0us then (area was NOT touched)
+    ///     let untVal = if diff <> 0 then diff - 2 else 0x13
+    ///     upBase.[2*i] <- 0x80uy
+    ///     upBase.[2*i + 1] <- byte (untVal &&& 0xff)
+    let calcFdtUpBase (touchFlag: uint16) (fdtData: byte[]) (fdtDiff: int16 option) : byte[] =
+        let diff = defaultArg fdtDiff 0x15s
+        let diffVal = int diff
+        if isNull fdtData || fdtData.Length < 16 then
+            [|
+                0x91uy; 0x91uy; 0x8buy; 0x8buy
+                0x96uy; 0x96uy; 0x91uy; 0x91uy
+                0x98uy; 0x98uy; 0x90uy; 0x90uy
+                0x92uy; 0x92uy; 0x88uy; 0x88uy
+            |]
+        else
+            let upBase = Array.zeroCreate<byte> 16
+            for i in 0 .. 7 do
+                let w = uint16 fdtData.[2 * i] ||| (uint16 fdtData.[2 * i + 1] <<< 8)
+                let wShift = (int w) >>> 1
+                let upVal = (wShift + diffVal) &&& 0xff
+                upBase.[2 * i] <- 0x80uy
+                upBase.[2 * i + 1] <- byte upVal
+
+            for i in 0 .. 7 do
+                if (touchFlag &&& (1us <<< i)) = 0us then
+                    let untVal = (if diffVal <> 0 then diffVal - 2 else 0x13) &&& 0xff
+                    upBase.[2 * i] <- 0x80uy
+                    upBase.[2 * i + 1] <- byte untVal
+            upBase
+
 // ============================================================================
 // High-Level Goodix 53xd Driver
 // ============================================================================
@@ -438,7 +476,8 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
         let! fdtResp0 = this.ReadCommandResponse(Protocol.CommandMcuSwitchToFdtMode, 2000)
         if fdtResp0.Length >= 20 && currentFdtDownBase.IsNone then
             let rawFdt = Array.sub fdtResp0 4 16
-            currentFdtDownBase <- Some (FdtCalculations.calcFdtDownBase rawFdt)
+            let downBase = FdtCalculations.calcFdtDownBase rawFdt
+            currentFdtDownBase <- Some downBase
 
         // 8.3: write_sensor_register 0x022c = [0x0a, 0x03]
         do! this.SendAndExpectAck(Protocol.packWriteSensorRegister 0x022cus [| 0x0auy; 0x03uy |], Protocol.CommandWriteSensorRegister)
@@ -498,7 +537,8 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
         let! fdtResp = this.ReadCommandResponse(Protocol.CommandMcuSwitchToFdtMode, 2000)
         if fdtResp.Length >= 20 then
             let rawFdt = Array.sub fdtResp 4 16
-            currentFdtDownBase <- Some (FdtCalculations.calcFdtDownBase rawFdt)
+            let downBase = FdtCalculations.calcFdtDownBase rawFdt
+            currentFdtDownBase <- Some downBase
 
         // 8.19: mcu_switch_to_sleep_mode
         do! this.SendAndExpectAck(Protocol.packSwitchToSleepMode(), Protocol.CommandMcuSwitchToSleepMode)
@@ -568,10 +608,11 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
         do! this.SendAndExpectAck(Protocol.packSwitchToFdtDown fdtDownWait, Protocol.CommandMcuSwitchToFdtDown)
         let! downPayload = this.ReadCommandResponse(Protocol.CommandMcuSwitchToFdtDown, timeout)
 
-        // 3. Extract FDT baseline up data if present in payload (offset 4..19: 16 bytes = 8 words)
+        // 3. Extract FDT baseline up data if present in payload (offset 2..3: touch_flag, offset 4..19: 16 bytes = 8 words)
         if downPayload.Length >= 20 then
+            let touchFlag = uint16 downPayload.[2] ||| (uint16 downPayload.[3] <<< 8)
             let fdtData = Array.sub downPayload 4 16
-            let upBase = FdtCalculations.calcFdtDownBase fdtData
+            let upBase = FdtCalculations.calcFdtUpBase touchFlag fdtData None
             lastFdtUpBase <- Some upBase
 
         // 4. Immediately perform post-touch 0x36 mode switch (matching driver_53xd.py lines 242-252)
@@ -633,8 +674,14 @@ type Goodix53xdDevice(transport: IUsbTransport, tlsTunnel: ITlsPskTunnel) =
                     0x98uy; 0x98uy; 0x90uy; 0x90uy
                     0x92uy; 0x92uy; 0x88uy; 0x88uy
                 |]
-        let upPayload = Array.concat [| [| 0x8cuy; 0x01uy |]; dacBytes; upThresholds; [| 0x01uy |] |]
-        do! this.SendAndExpectAck(Protocol.packSwitchToFdtUp upPayload, Protocol.CommandMcuSwitchToFdtUp)
+
+        // 1. Send 0x34 with reply = false
+        let fdtUpNoReply = Array.concat [| [| 0x8euy; 0x01uy |]; dacBytes; upThresholds; [| 0x00uy |] |]
+        do! this.SendAndExpectAck(Protocol.packSwitchToFdtUp fdtUpNoReply, Protocol.CommandMcuSwitchToFdtUp)
+
+        // 2. Send 0x34 with reply = true and wait for finger lift event
+        let fdtUpWait = Array.concat [| [| 0x8euy; 0x01uy |]; dacBytes; upThresholds; [| 0x01uy |] |]
+        do! this.SendAndExpectAck(Protocol.packSwitchToFdtUp fdtUpWait, Protocol.CommandMcuSwitchToFdtUp)
         let! _ = this.ReadCommandResponse(Protocol.CommandMcuSwitchToFdtUp, timeout)
         return ()
     }

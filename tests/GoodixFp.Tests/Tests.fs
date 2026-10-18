@@ -1051,5 +1051,65 @@ let ``FdtCalculations calcFdtDownBase returns fallback for null or short input``
     let fallbackShort = FdtCalculations.calcFdtDownBase [| 0x01uy; 0x02uy |]
     Assert.Equal(16, fallbackShort.Length)
 
+[<Fact>]
+let ``FdtCalculations calcFdtUpBase transforms raw baseline with touch flags correctly`` () =
+    // 8 words: 0x0122, 0x0124, 0x0116, 0x0116, 0x012c, 0x012c, 0x0122, 0x0122
+    // w >>> 1: 0x91,   0x92,   0x8b,   0x8b,   0x96,   0x96,   0x91,   0x91
+    // with diff = 0x15 (21):
+    // elevated: 0xa6,   0xa7,   0xa0,   0xa0,   0xab,   0xab,   0xa6,   0xa6
+    // untouched (diff - 2): 0x13
+    let rawFdt = [|
+        0x22uy; 0x01uy
+        0x24uy; 0x01uy
+        0x16uy; 0x01uy
+        0x16uy; 0x01uy
+        0x2cuy; 0x01uy
+        0x2cuy; 0x01uy
+        0x22uy; 0x01uy
+        0x22uy; 0x01uy
+    |]
+
+    // Scenario 1: touchFlag = 0x00FF (all 8 areas touched)
+    let upBaseAll = FdtCalculations.calcFdtUpBase 0x00FFus rawFdt (Some 0x15s)
+    Assert.Equal<byte seq>(
+        [|
+            0x80uy; 0xa6uy
+            0x80uy; 0xa7uy
+            0x80uy; 0xa0uy
+            0x80uy; 0xa0uy
+            0x80uy; 0xabuy
+            0x80uy; 0xabuy
+            0x80uy; 0xa6uy
+            0x80uy; 0xa6uy
+        |],
+        upBaseAll
+    )
+
+    // Scenario 2: touchFlag = 0x0003 (only areas 0 and 1 touched, areas 2..7 untouched)
+    let upBasePartial = FdtCalculations.calcFdtUpBase 0x0003us rawFdt (Some 0x15s)
+    Assert.Equal<byte seq>(
+        [|
+            0x80uy; 0xa6uy
+            0x80uy; 0xa7uy
+            0x80uy; 0x13uy
+            0x80uy; 0x13uy
+            0x80uy; 0x13uy
+            0x80uy; 0x13uy
+            0x80uy; 0x13uy
+            0x80uy; 0x13uy
+        |],
+        upBasePartial
+    )
+
+[<Fact>]
+let ``FdtCalculations calcFdtUpBase returns fallback for null or short input`` () =
+    let fallback = FdtCalculations.calcFdtUpBase 0x00FFus null None
+    Assert.Equal(16, fallback.Length)
+    Assert.Equal(0x91uy, fallback.[0])
+    Assert.Equal(0x91uy, fallback.[1])
+
+    let fallbackShort = FdtCalculations.calcFdtUpBase 0x00FFus [| 0x01uy; 0x02uy |] None
+    Assert.Equal(16, fallbackShort.Length)
+
 
 

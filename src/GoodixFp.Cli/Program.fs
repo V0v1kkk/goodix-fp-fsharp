@@ -396,28 +396,56 @@ module DeviceRunner =
                                     eprintfn $"\n[!] Capture failed: {err}"
                                     failure <- true
                                 | Ok frame ->
-                                    let! _ = dev.WaitForFingerUp(timeoutMs = 5000)
-                                    if enrolledCount = 0 then
-                                        try
-                                            let dir = "/tmp/goodix-fp"
-                                            if not (Directory.Exists dir) then Directory.CreateDirectory dir |> ignore
-                                            let sampleRawPgm = FrameDecoder.toPgm12Bit frame.Pixels 80 64
-                                            File.WriteAllBytes(Path.Combine(dir, "enroll-sample1-raw16.pgm"), sampleRawPgm)
-                                            match matcher.Preprocess(frame) with
-                                            | Ok p ->
-                                                let enhPgm = FrameDecoder.toPgm8Bit p.NormalizedPixels 80 64
-                                                File.WriteAllBytes(Path.Combine(dir, "enroll-sample1-enhanced8.pgm"), enhPgm)
-                                            | _ -> ()
-                                        with _ -> ()
-                                    match matcher.MergeSample(frame.Pixels) with
-                                    | Error err ->
-                                        eprintfn $"\n[!] Touch rejected ({err}), please lift finger and try step [{enrolledCount + 1}/12] again..."
-                                        let! _ = dev.WaitForFingerUp(timeoutMs = 5000)
-                                        ()
-                                    | Ok count ->
-                                        enrolledCount <- count
-                                        printfn "Sample accepted! (Lift finger)"
+                                    let hasTouch =
+                                        match dev.BaselineFrame with
+                                        | None -> true
+                                        | Some b ->
+                                            let mutable sigCount = 0
+                                            for i in 0 .. frame.Pixels.Length - 1 do
+                                                if abs (int frame.Pixels.[i] - int b.Pixels.[i]) > 30 then
+                                                    sigCount <- sigCount + 1
+                                            sigCount > 50
+
+                                    if not hasTouch then
+                                        printfn "(transient noise, retrying...)"
+                                    else
+                                        printf "Lift finger... "
                                         Console.Out.Flush()
+                                        let mutable fingerLifted = false
+                                        while not fingerLifted && not failure do
+                                            let! upRes = dev.WaitForFingerUp(timeoutMs = 5000)
+                                            match upRes with
+                                            | Ok () ->
+                                                fingerLifted <- true
+                                            | Error (UsbError (_, -7)) ->
+                                                printf "(still holding, please lift)... "
+                                                Console.Out.Flush()
+                                            | Error err ->
+                                                eprintfn $"\n[!] Finger up detection failed: {err}"
+                                                failure <- true
+
+                                        if fingerLifted then
+                                            printfn "OK"
+                                            if enrolledCount = 0 then
+                                                try
+                                                    let dir = "/tmp/goodix-fp"
+                                                    if not (Directory.Exists dir) then Directory.CreateDirectory dir |> ignore
+                                                    let sampleRawPgm = FrameDecoder.toPgm12Bit frame.Pixels 80 64
+                                                    File.WriteAllBytes(Path.Combine(dir, "enroll-sample1-raw16.pgm"), sampleRawPgm)
+                                                    match matcher.Preprocess(frame) with
+                                                    | Ok p ->
+                                                        let enhPgm = FrameDecoder.toPgm8Bit p.NormalizedPixels 80 64
+                                                        File.WriteAllBytes(Path.Combine(dir, "enroll-sample1-enhanced8.pgm"), enhPgm)
+                                                    | _ -> ()
+                                                with _ -> ()
+
+                                            match matcher.MergeSample(frame.Pixels) with
+                                            | Error err ->
+                                                eprintfn $"[!] Touch rejected ({err}), please try step [{enrolledCount + 1}/12] again..."
+                                            | Ok count ->
+                                                enrolledCount <- count
+                                                printfn $"[+] Sample [{enrolledCount}/12] accepted!"
+                                                Console.Out.Flush()
 
                         let! _ = dev.Sleep()
 
