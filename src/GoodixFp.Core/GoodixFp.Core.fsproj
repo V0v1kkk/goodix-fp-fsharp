@@ -5,6 +5,7 @@
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <IsAotCompatible>true</IsAotCompatible>
+    <NoWarn>$(NoWarn);IL2075;IL2026</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>

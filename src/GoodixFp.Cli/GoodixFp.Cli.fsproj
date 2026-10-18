@@ -7,7 +7,7 @@
     <PublishAot>true</PublishAot>
     <InvariantGlobalization>true</InvariantGlobalization>
     <StripSymbols>true</StripSymbols>
-    <NoWarn>$(NoWarn);IL2104;IL3053;FS3511;3511</NoWarn>
+    <NoWarn>$(NoWarn);IL2104;IL3053;IL2075;IL2026;FS3511;3511</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>

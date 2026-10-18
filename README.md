@@ -229,12 +229,13 @@ goodix-fp enroll index_right
 *Tip: Place your finger firmly on the sensor with slight angle/roll adjustments between touches to build comprehensive template coverage.*
 
 ### 4. Verification
-Verify your finger against all enrolled templates:
+Verify your finger against all enrolled templates with automatic multi-touch retries (default: 3 attempts):
 ```bash
-goodix-fp verify
+goodix-fp verify [--retries <N>]
 ```
-On match: prints `[+] MATCH VERIFIED: index_right` and exits with code `0`.  
-On mismatch/timeout: prints `[-] NO MATCH (Access Denied)` and exits with code `1`.
+- On match at any attempt: prints `[+] MATCH VERIFIED: <finger-name>`, puts device to sleep, and exits with code `0`.
+- On touch mismatch: prompts `[-] Touch not recognized (attempt {attempt}/{maxRetries}). Please place finger firmly on sensor again...`, waits for finger lift, and rearms detector.
+- If all retries are exhausted: prints `[-] Verification failed: no matching finger after {maxRetries} attempts (Access Denied)` and exits with code `1`.
 
 ---
 
