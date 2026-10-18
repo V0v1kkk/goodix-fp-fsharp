@@ -225,8 +225,8 @@ type GoodixTodMatcherBenchmark() =
                 let dy = float y - cy
                 let r = Math.Sqrt(dx * dx + dy * dy)
                 let theta = Math.Atan2(dy, dx)
-                let ridge = Math.Sin(r * 0.8 - theta * 3.0)
-                let rawVal = 2048.0 + 800.0 * ridge + noise * (float ((x * 17 + y * 31) % 50) - 25.0)
+                let ridge = Math.Cos(r * 0.8 + 2.0 * theta)
+                let rawVal = 1500.0 + 350.0 * ridge + noise * (float ((x * 17 + y * 31) % 10) - 5.0)
                 let clamped = Math.Clamp(rawVal, 0.0, 4095.0)
                 pixels.[y * width + x] <- uint16 clamped
         pixels
@@ -246,14 +246,14 @@ type GoodixTodMatcherBenchmark() =
 
             testFrame <- GoodixTodMatcherBenchmark.GenerateSyntheticRidgeFrame(0.5, 0.5, 1.0)
 
-            matcher.StartEnroll() |> Result.defaultWith (fun e -> failwith (string e)) |> ignore
+            matcher.StartEnroll() |> ignore
             for i in 0 .. 11 do
                 let sx = float (i % 3 - 1) * 1.5
                 let sy = float (i / 3 - 2) * 1.5
                 let sample = GoodixTodMatcherBenchmark.GenerateSyntheticRidgeFrame(sx, sy, 1.0)
-                matcher.MergeSample(sample) |> Result.defaultWith (fun e -> failwith (string e)) |> ignore
+                matcher.MergeSample(sample) |> ignore
 
-            let fid = FingerId.create "bench_finger" |> Result.defaultWith (fun e -> failwith (string e))
+            let fid = FingerId.createUnsafe "bench_finger"
             let blob = matcher.CommitTemplate(fid) |> Result.defaultWith (fun e -> failwith (string e))
             enrolledTemplates <- [ (fid, blob) ]
 
