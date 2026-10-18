@@ -4,7 +4,7 @@
 [![Native AOT](https://img.shields.io/badge/Native%20AOT-enabled-success?logo=speedtest&logoColor=white)](https://learn.microsoft.com/en-us/dotnet/core/deploying/native-aot/)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20x64-blue?logo=linux&logoColor=white)](https://kernel.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/Tests-41%20Passed-brightgreen)](tests/GoodixFp.Tests/)
+[![Tests](https://img.shields.io/badge/Tests-51%20Passed-brightgreen)](tests/GoodixFp.Tests/)
 
 Production-grade, pure **F# 10** reverse-engineered driver and protocol toolkit for **Goodix 53xc / 53xd** fingerprint sensors (e.g., `0x27c6:0x538d`, `0x27c6:0x530c`, `0x27c6:0x532d` found on Dell XPS 13 9300/9310, Inspiron, and Vostro laptops).
 
@@ -263,7 +263,7 @@ Authenticate `sudo` commands using your fingerprint reader in place of a passwor
 Run all unit, integration, and cryptographic verification tests:
 
 ```bash
-# Run all 41 test cases
+# Run all 51 test cases
 dotnet test GoodixFp.sln
 
 # Run in-memory Native AOT benchmark suite

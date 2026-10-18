@@ -21,6 +21,8 @@
 
   <ItemGroup>
     <PackageReference Include="FsToolkit.ErrorHandling" Version="5.2.0" />
+    <TrimmerRootAssembly Include="BouncyCastle.Cryptography" />
+    <RdXmlFile Include="rd.xml" />
   </ItemGroup>
 
 </Project>
